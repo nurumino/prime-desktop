@@ -1,16 +1,20 @@
 import { EventEmitter } from 'events'
-import { existsSync, readdirSync } from 'fs'
-import { readFile, writeFile, mkdir, stat, readdir } from 'fs/promises'
+import { existsSync, readdirSync, statSync } from 'fs'
+import { readFile, writeFile, mkdir, stat, readdir, rm } from 'fs/promises'
 import { homedir } from 'os'
+import { randomUUID } from 'crypto'
 import { join, basename, resolve } from 'path'
 import { RpcClient } from './rpc'
 import { DaemonTransport, type DaemonTreeNode } from './daemonTransport'
 import { BinaryManager } from './binary'
 import {
-  commitAll,
   changedFiles,
+  checkpointExists,
+  createCheckpointSnapshot,
+  deleteCheckpointRef,
+  isCheckpointId,
   isGitRepo,
-  checkoutCommit,
+  restoreCheckpointSnapshot,
   statusShort,
   diffForFile,
   gitStatus as readGitStatus,
@@ -27,7 +31,10 @@ import {
   setAgentTracesEnabled,
   writePrimeRlmMaxDepth,
   getMcpServers,
-  setMcpServer
+  setMcpServer,
+  getModelRoles,
+  setModelRole,
+  getMcpCatalog
 } from './primeFiles'
 import { modelKeyFromState, parseModelList } from '@shared/models'
 import { isInternalStateRestoreMessage } from '@shared/messageVisibility'
@@ -58,6 +65,67 @@ const APP_SUPPORT_DIR = join(homedir(), 'Library', 'Application Support', 'Prime
 const APP_DAEMON_SOCKET = join(APP_SUPPORT_DIR, 'prime-agent.sock')
 const MODELS_FILE = join(homedir(), '.prime', 'agent', 'models.json')
 
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.cache', '.turbo', '.prime'])
+const SKIP_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.lockb', '.exe', '.dll', '.dylib', '.so', '.bin'])
+const SNAPSHOT_MAX_FILES = 5000
+const snapshotCache = new Map<string, Map<string, number>>()
+
+interface SnapshotEntry { mtime: number }
+
+function walkProject(root: string): Map<string, SnapshotEntry> {
+  const out = new Map<string, SnapshotEntry>()
+  const stack = [root]
+  while (stack.length > 0 && out.size < SNAPSHOT_MAX_FILES) {
+    const dir = stack.pop()!
+    let entries: string[]
+    try {
+      entries = readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of entries) {
+      if (name === '.' || name === '..') continue
+      const full = join(dir, name)
+      let s
+      try {
+        s = statSync(full)
+      } catch {
+        continue
+      }
+      if (s.isDirectory()) {
+        if (SKIP_DIRS.has(name)) continue
+        stack.push(full)
+      } else if (s.isFile()) {
+        const ext = name.slice(name.lastIndexOf('.'))
+        if (SKIP_EXT.has(ext.toLowerCase())) continue
+        out.set(full.slice(root.length + 1), { mtime: s.mtimeMs })
+      }
+    }
+  }
+  return out
+}
+
+function snapshotFileChanges(root: string): FileDiff[] {
+  const current = walkProject(root)
+  const prev = snapshotCache.get(root)
+  snapshotCache.set(root, new Map([...current.entries()].map(([p, e]) => [p, e.mtime])))
+  if (!prev) {
+    return [...current.entries()].map(([p]) => ({ path: p, status: 'modified' as const, diff: '' }))
+  }
+  const out: FileDiff[] = []
+  for (const [path, entry] of current) {
+    if (!prev.has(path)) {
+      out.push({ path, status: 'added', diff: `+${entry.mtime}` })
+    } else if (prev.get(path) !== entry.mtime) {
+      out.push({ path, status: 'modified', diff: `${entry.mtime}` })
+    }
+  }
+  for (const path of prev.keys()) {
+    if (!current.has(path)) out.push({ path, status: 'deleted', diff: '' })
+  }
+  return out
+}
+
 interface Agent {
   id: string
   tabId: string
@@ -75,6 +143,9 @@ interface Agent {
   stats: unknown
   lastEvent: string
   pendingRuntimeReload: boolean
+  pendingModelSwitch: { provider?: string; modelId: string } | null
+  connecting: Promise<void> | null
+  sessionChange: Promise<void>
 }
 
 export class AgentManager extends EventEmitter {
@@ -94,22 +165,34 @@ export class AgentManager extends EventEmitter {
   // ---------- Lifecycle ----------
 
   async openTab(tab: ProjectTab, settings: AppSettings): Promise<AgentInfo> {
-    const existing = [...this.agents.values()].find((a) => a.tabId === tab.id)
+    if (!existsSync(tab.path) || !statSync(tab.path).isDirectory()) {
+      throw new Error(`Project folder does not exist: ${tab.path}`)
+    }
+    const existing = this.agents.get(primaryAgentId(tab.id))
     if (existing) {
       existing.info.path = tab.path
       existing.path = tab.path
+      await this.ensureConnected(existing, settings)
       return existing.info
     }
-    const id = `agent-${tab.id}`
-    const agent: Agent = {
+    const agent = this.createAgent(tab.id, tab.path, primaryAgentId(tab.id))
+    this.agents.set(agent.id, agent)
+    this.publish(agent)
+    await this.ensureConnected(agent, settings)
+    return agent.info
+  }
+
+  private createAgent(tabId: string, path: string, id: string): Agent {
+    return {
       id,
-      tabId: tab.id,
-      path: tab.path,
+      tabId,
+      path,
       client: null,
       info: {
         id,
-        name: basename(tab.path),
-        path: tab.path,
+        tabId,
+        name: basename(path),
+        path,
         status: 'starting',
         model: null,
         thinkingLevel: null,
@@ -122,7 +205,8 @@ export class AgentManager extends EventEmitter {
         contextWindow: null,
         isStreaming: false,
         sessionName: null,
-        sessionId: null
+        sessionId: null,
+        retry: null
       },      messages: [],
       dialogs: new Map(),
       checkpoints: [],
@@ -133,12 +217,143 @@ export class AgentManager extends EventEmitter {
       commands: null,
       stats: null,
       lastEvent: '',
-      pendingRuntimeReload: false
+      pendingRuntimeReload: false,
+      pendingModelSwitch: null,
+      connecting: null,
+      sessionChange: Promise.resolve()
     }
-    this.agents.set(id, agent)
+  }
+
+  // ---------- Parallel chats ----------
+  //
+  // Each chat that is live at the same time gets its own daemon connection
+  // (and so its own worker). The project's primary connection always exists;
+  // extra slots are opened when the user starts or opens a chat while the
+  // current one is busy, and are released again once they sit idle.
+
+  private tabAgents(tabId: string): Agent[] {
+    return [...this.agents.values()].filter((agent) => agent.tabId === tabId)
+  }
+
+  private primaryOf(agent: Agent): Agent {
+    return this.agents.get(primaryAgentId(agent.tabId)) ?? agent
+  }
+
+  /** The project-level agent id for any chat slot, e.g. for the shared terminal. */
+  projectAgentId(agentId: string): string {
+    const agent = this.agents.get(agentId)
+    return agent ? primaryAgentId(agent.tabId) : agentId
+  }
+
+  private isIdle(agent: Agent): boolean {
+    return Boolean(agent.client?.running)
+      && agent.info.status === 'idle'
+      && !agent.info.isStreaming
+      && agent.dialogs.size === 0
+      && !agent.connecting
+  }
+
+  private async openSlot(tabId: string, settings: AppSettings): Promise<Agent> {
+    const primary = this.agents.get(primaryAgentId(tabId))
+    if (!primary) throw new Error('Project is not open')
+    if (this.tabAgents(tabId).length >= MAX_CHATS_PER_PROJECT) {
+      throw new Error(`Up to ${MAX_CHATS_PER_PROJECT} chats can run at once in a project. Stop one first.`)
+    }
+    const agent = this.createAgent(tabId, primary.path, `${primaryAgentId(tabId)}--${randomUUID().slice(0, 8)}`)
+    this.agents.set(agent.id, agent)
     this.publish(agent)
-    await this.connect(agent, settings)
-    return agent.info
+    try {
+      await this.ensureConnected(agent, settings)
+    } catch (error) {
+      await this.closeChat(agent.id)
+      throw error
+    }
+    return agent
+  }
+
+  private async releaseIdleSlots(tabId: string, keep: string): Promise<void> {
+    const primaryId = primaryAgentId(tabId)
+    const idle = this.tabAgents(tabId).filter((agent) => agent.id !== primaryId && agent.id !== keep && this.isIdle(agent))
+    await Promise.all(idle.map((agent) => this.closeChat(agent.id)))
+  }
+
+  private focusChat(agent: Agent): void {
+    this.emitToRenderer('events', { agentId: agent.id, type: 'chat_focus', payload: { tabId: agent.tabId } } as PrimeEvent)
+  }
+
+  /** Start a fresh chat. A busy chat keeps running; the new one gets its own slot. */
+  async newChat(agentId: string, settings: AppSettings): Promise<string> {
+    const agent = this.agents.get(agentId)
+    if (!agent) throw new Error('Agent not connected')
+    let target: Agent
+    if (this.isIdle(agent)) {
+      // Serialize session replacement with prompts: a new-chat click and a
+      // fast prompt can otherwise cross on the IPC boundary.
+      const change = agent.sessionChange.then(() => this.newSession(agent.id))
+      agent.sessionChange = change.then(() => undefined, () => undefined)
+      await change
+      target = agent
+    } else {
+      // A slot whose chat has no messages yet is already a blank new chat.
+      target = this.tabAgents(agent.tabId).find((slot) => slot !== agent && this.isIdle(slot) && slot.info.messageCount === 0)
+        ?? await this.openSlot(agent.tabId, settings)
+    }
+    await this.releaseIdleSlots(agent.tabId, target.id)
+    this.focusChat(target)
+    return target.id
+  }
+
+  /** Open a saved chat without interrupting any chat that is still running. */
+  async openSession(agentId: string, sessionPath: string, settings: AppSettings): Promise<string> {
+    const agent = this.agents.get(agentId)
+    if (!agent) throw new Error('Agent not connected')
+    const sessionId = await readSessionId(sessionPath)
+    let target = sessionId ? this.tabAgents(agent.tabId).find((slot) => slot.info.sessionId === sessionId) : undefined
+    if (!target) {
+      target = this.isIdle(agent)
+        ? agent
+        : this.tabAgents(agent.tabId).find((slot) => this.isIdle(slot)) ?? await this.openSlot(agent.tabId, settings)
+      await this.resumeSession(target.id, sessionPath)
+    }
+    await this.releaseIdleSlots(agent.tabId, target.id)
+    this.focusChat(target)
+    return target.id
+  }
+
+  /** Stop a chat slot's worker and forget it. The project's primary chat is never closed here. */
+  async closeChat(agentId: string): Promise<void> {
+    const agent = this.agents.get(agentId)
+    if (!agent || agent.id === primaryAgentId(agent.tabId)) return
+    this.agents.delete(agentId)
+    agent.starts++
+    await agent.client?.release().catch(() => {})
+    this.emitToRenderer('events', { agentId, type: 'agent_closed', payload: { tabId: agent.tabId } } as PrimeEvent)
+  }
+
+  closeTab(tabId: string): void {
+    for (const agent of this.tabAgents(tabId)) {
+      if (agent.id === primaryAgentId(tabId)) this.closeAgent(agent.id)
+      else void this.closeChat(agent.id)
+    }
+  }
+
+  private async ensureConnected(agent: Agent, settings: AppSettings): Promise<void> {
+    if (agent.client?.running) return
+    if (agent.connecting) return agent.connecting
+
+    const connecting = (async () => {
+      agent.client?.kill()
+      agent.client = null
+      agent.info.status = 'starting'
+      this.publish(agent)
+      await this.connect(agent, settings)
+    })()
+    agent.connecting = connecting
+    try {
+      await connecting
+    } finally {
+      if (agent.connecting === connecting) agent.connecting = null
+    }
   }
 
   private async connect(agent: Agent, settings: AppSettings): Promise<void> {
@@ -239,10 +454,25 @@ export class AgentManager extends EventEmitter {
       case 'agent_end':
         agent.info.status = 'idle'
         agent.info.isStreaming = false
+        agent.info.retry = null
         // Prime Agent owns and drains its steering/follow-up queue. The
         // session_action_update event is a read-only snapshot for UI display;
         // replaying an item here re-enqueues it after every turn forever.
         this.refreshStats(agent)
+        if (agent.pendingModelSwitch && agent.client?.running) {
+          const target = agent.pendingModelSwitch
+          agent.pendingModelSwitch = null
+          void agent.client.send({ type: 'set_model', provider: target.provider, modelId: target.modelId })
+            .then(() => {
+              agent.info.model = target.provider ? `${target.provider}/${target.modelId}` : target.modelId
+              this.publish(agent)
+              this.toast(agent, 'success', `Model switched to ${target.modelId}`)
+            })
+            .catch((switchError) => {
+              console.error('[prime-desktop] deferred set_model failed:', switchError)
+              this.toast(agent, 'error', 'Could not switch model after the task finished.')
+            })
+        }
         if (agent.pendingRuntimeReload) {
           agent.pendingRuntimeReload = false
           void agent.client?.send({ type: 'reload' }).then(() => {
@@ -251,6 +481,7 @@ export class AgentManager extends EventEmitter {
             console.error('[prime-desktop] runtime recovery reload failed:', error)
           })
         }
+        this.emit('completion', { agentId: agent.id, name: agent.info.name })
         break
       case 'message_update': {
         const m = ev.message as Record<string, unknown> | undefined
@@ -266,9 +497,12 @@ export class AgentManager extends EventEmitter {
       case 'custom_message': {
         if (ev.display === false) break
         if (ev.customType === 'ipython_state_restored') break
-        if (ev.customType === 'agent_message') {
+        if (ev.customType === 'agent_message' || ev.customType === 'refinement_outcome') {
           this.upsertMessage(agent, { ...ev, role: 'assistant' })
         } else if (
+          ev.customType === 'rlm_child_failure' ||
+          ev.customType === 'rlm_child_terminal_notice' ||
+          ev.customType === 'mcp_connection_outcome' ||
           ev.customType === 'session_slash_command' ||
           ev.customType === 'session_slash_command_result' ||
           ev.customType === 'compaction_outcome'
@@ -305,6 +539,11 @@ export class AgentManager extends EventEmitter {
       }
       case 'session_started':
         agent.info.extensionUi = undefined
+        // A fresh session means the previous run is gone. Clear eagerly;
+        // agent_start/turn_start will re-set these if work actually resumes.
+        agent.info.isStreaming = false
+        agent.info.status = 'idle'
+        agent.info.retry = null
         break
       case 'turn_start':
         agent.info.status = 'working'
@@ -336,14 +575,20 @@ export class AgentManager extends EventEmitter {
         agent.queued.followUps = a.followUps ?? []
         break
       }
-      case 'compaction_start':
-        this.toast(agent, 'info', 'Compacting context…')
-        break
-      case 'compaction_end':
-        this.toast(agent, 'success', 'Context compacted')
-        break
       case 'auto_retry_start':
+        agent.info.retry = {
+          attempt: Number(ev.attempt ?? 0),
+          maxAttempts: Number(ev.maxAttempts ?? 0),
+          errorMessage: typeof ev.errorMessage === 'string' ? ev.errorMessage : undefined
+        }
         this.toast(agent, 'warning', `Retrying (attempt ${String(ev.attempt)})`)
+        break
+      case 'auto_retry_end':
+        agent.info.retry = null
+        // Exhausted retries must not die silently: surface why the run ended.
+        if (ev.success === false && typeof ev.finalError === 'string' && ev.finalError.trim()) {
+          this.toast(agent, 'error', `Retries failed — ${ev.finalError.slice(0, 180)}`)
+        }
         break
       case 'extension_ui_request': {
         const id = ev.id as string
@@ -484,6 +729,8 @@ export class AgentManager extends EventEmitter {
   }
 
   private publish(agent: Agent): void {
+    // A released chat slot can still deliver a late event; don't resurrect it.
+    if (this.agents.get(agent.id) !== agent) return
     this.emitToRenderer('events', { agentId: agent.id, type: 'agent_info', payload: agent.info } as PrimeEvent)
   }
 
@@ -509,18 +756,46 @@ export class AgentManager extends EventEmitter {
       }
       return { models: await localModelCatalog() }
     }
-    if (!agent || !agent.client?.running) throw new Error('Agent not connected')
-    if (cmd.type === 'new_session') return this.newSession(agentId)
-    if (cmd.type === 'prompt' && settings.checkpoints) {
+    if (!agent) throw new Error('Agent not connected')
+    await this.ensureConnected(agent, settings)
+    if (!agent.client?.running) throw new Error('Agent not connected')
+    if (cmd.type === 'new_session') {
+      // Replacing a busy chat's session would stop its run, so newChat gives
+      // the new chat its own slot in that case.
+      return { agentId: await this.newChat(agentId, settings) }
+    }
+    await agent.sessionChange
+    // A steer or queued follow-up lands mid-run; snapshotting then would
+    // capture half-finished work as a "before" state.
+    const midRun = agent.info.isStreaming || agent.info.status === 'working'
+      || (cmd as { streamingBehavior?: string }).streamingBehavior === 'steer'
+    if (cmd.type === 'prompt' && settings.checkpoints && !midRun) {
       await this.createCheckpoint(agent, 'before-prompt')
     }
     if (cmd.type === 'set_model') {
-      const res = await agent.client.send(cmd as Record<string, unknown>)
-      const provider = (cmd as { provider?: string }).provider
-      const modelId = (cmd as { modelId?: string }).modelId
-      if (modelId) agent.info.model = provider ? `${provider}/${modelId}` : modelId
-      this.publish(agent)
-      return res
+      const req = cmd as { provider?: string; modelId?: string }
+      try {
+        const res = await agent.client.send(cmd as Record<string, unknown>)
+        // The daemon echoes the model that is actually active now — trust it
+        // over what was requested.
+        const data = ((res as { data?: Record<string, unknown> }).data ?? res) as Record<string, unknown>
+        const model = (data.model ?? data) as Record<string, unknown> | undefined
+        const actualProvider = typeof model?.provider === 'string' ? model.provider : req.provider
+        const actualId = typeof model?.id === 'string' ? model.id : req.modelId
+        if (actualId) agent.info.model = actualProvider ? `${actualProvider}/${actualId}` : actualId
+        agent.pendingModelSwitch = null
+        this.publish(agent)
+        return res
+      } catch (error) {
+        // A run in flight may hold its model until it finishes. Keep the
+        // request and apply it on agent_end instead of dropping it silently.
+        if (agent.info.isStreaming || agent.info.status === 'working') {
+          if (req.modelId) agent.pendingModelSwitch = { provider: req.provider, modelId: req.modelId }
+          this.toast(agent, 'info', 'Model will switch when the current task finishes.')
+          return { queued: true }
+        }
+        throw error
+      }
     }
     return agent.client.send(cmd as Record<string, unknown>)
   }
@@ -574,7 +849,7 @@ export class AgentManager extends EventEmitter {
         const entries = header.entries as unknown[] | undefined
         const firstEntry = entries?.[0] as Record<string, unknown> | undefined
         const dir = String(header.cwd ?? header.workingDirectory ?? firstEntry?.workingDirectory ?? '') || null
-        if (projectPath && (!dir || resolve(dir) !== resolve(projectPath))) continue
+        if (projectPath && (!dir || (resolve(dir) !== resolve(projectPath) && !(basename(dir) === basename(projectPath) && !existsSync(dir))))) continue
 
         const messageRecords = records.filter((record) => record.type === 'message')
         const firstUser = messageRecords.map((record) => record.message as Record<string, unknown> | undefined)
@@ -592,7 +867,7 @@ export class AgentManager extends EventEmitter {
           sessionId: String(header.id ?? header.sessionId ?? f.replace('.jsonl', '')),
           messageCount: messageRecords.length || Number(header.messageCount ?? 0),
           workingDirectory: dir,
-          mtime: st.mtimeMs,
+          mtime: lastPromptAt(records) ?? st.mtimeMs,
           name: explicitName ?? sessionTitle(firstText)
         })
       } catch {
@@ -606,7 +881,7 @@ export class AgentManager extends EventEmitter {
   async resumeSession(agentId: string, sessionPath: string): Promise<unknown> {
     const agent = this.agents.get(agentId)
     if (!agent?.client) throw new Error('Agent not connected')
-    const res = await agent.client.send({ type: 'switch_session', sessionPath })
+    const res = await agent.client.send({ type: 'switch_session', sessionPath, cwdOverride: agent.path })
     const msgs = await agent.client.send({ type: 'get_messages' }).catch(() => null)
     if (msgs) {
       agent.messages = this.visibleMessages((msgs as { messages: unknown[] }).messages ?? [])
@@ -616,6 +891,9 @@ export class AgentManager extends EventEmitter {
       agent.info.sessionId = (state.sessionId as string | null) ?? agent.info.sessionId
       agent.info.sessionName = (state.sessionName as string | null) ?? null
       agent.info.messageCount = (state.messageCount as number) ?? agent.messages.length
+      agent.info.isStreaming = (state.isStreaming as boolean) ?? false
+      agent.info.status = agent.info.isStreaming ? 'working' : 'idle'
+      agent.info.retry = null
     }
     this.publish(agent)
     this.emitToRenderer('events', { agentId, type: 'session_resumed', payload: { sessionPath } } as PrimeEvent)
@@ -628,6 +906,13 @@ export class AgentManager extends EventEmitter {
     if (!agent?.client) throw new Error('Agent not connected')
     const target = (await this.getSessions(agentId)).find((session) => session.sessionFile === sessionPath)
     if (!target) return this.getSessions(agentId)
+    // The chat may be live in another parallel slot of this project.
+    const slot = this.tabAgents(agent.tabId).find((other) => other !== agent && other.info.sessionId === target.sessionId)
+    if (slot) {
+      if (!this.isIdle(slot)) throw new Error('This chat is still running. Stop it before deleting.')
+      if (slot.id === primaryAgentId(slot.tabId)) await this.newSession(slot.id)
+      else await this.closeChat(slot.id)
+    }
     const wasActive = target.sessionId === agent.info.sessionId
     if (wasActive) await this.newSession(agentId)
     try {
@@ -644,10 +929,16 @@ export class AgentManager extends EventEmitter {
     if (!agent?.client) throw new Error('Agent not connected')
     const res = await agent.client.send({ type: 'new_session' })
     agent.messages = []
+    // Replacing the session orphans the previous run: its agent_end never
+    // arrives, so streaming state must be re-synced from the daemon here or
+    // the composer stays stuck on "working" in the fresh chat.
     const state = await agent.client.send({ type: 'get_state' }).catch(() => null) as Record<string, unknown> | null
     agent.info.sessionId = (state?.sessionId as string | null) ?? null
     agent.info.sessionName = (state?.sessionName as string | null) ?? null
     agent.info.messageCount = 0
+    agent.info.isStreaming = (state?.isStreaming as boolean) ?? false
+    agent.info.status = agent.info.isStreaming ? 'working' : 'idle'
+    agent.info.retry = null
     this.publish(agent)
     this.emitToRenderer('events', { agentId, type: 'session_started', payload: { sessionId: agent.info.sessionId } } as PrimeEvent)
     return res
@@ -678,6 +969,18 @@ export class AgentManager extends EventEmitter {
   }
 
   // ---------- Fleet: schedules, heartbeats, observe, send ----------
+
+  // Drop cached catalogs and ask every resident agent to reload so changes
+  // like a newly added custom model become selectable without a restart.
+  async reloadAgents(): Promise<void> {
+    await Promise.all([...this.agents.values()].map(async (agent) => {
+      agent.skills = []
+      agent.availableModels = null
+      if (agent.client?.running) await agent.client.send({ type: 'reload' }).catch(() => {})
+    }))
+    // Model pickers refetch once every runtime has re-read models.json.
+    this.emitToRenderer('events', { agentId: '', type: 'models_changed', payload: {} } as PrimeEvent)
+  }
 
 
   async listSchedules(): Promise<Record<string, ScheduleJob[]>> {
@@ -789,6 +1092,20 @@ export class AgentManager extends EventEmitter {
     return agent.client.send({ type: 'send_message', targetActiveSessionId: target, message, deliveryMode: mode })
   }
 
+  // Terminal agents live on the CLI's daemon, not ours. A short-lived RPC
+  // process connects there by default, delivers the agent-to-agent message,
+  // and exits.
+  async messageExternal(target: string, message: string): Promise<unknown> {
+    if (!target.trim() || !message.trim()) throw new Error('Target and message are required')
+    const rpc = new RpcClient({ binary: this.binary.getBinary(), cwd: homedir(), args: ['--no-session'] })
+    try {
+      await rpc.start()
+      return await rpc.send({ type: 'send_message', targetActiveSessionId: target.trim(), message }, 30_000)
+    } finally {
+      rpc.kill()
+    }
+  }
+
   async getSubagentTree(agentId: string): Promise<import('@shared/types').SubagentNode[]> {
     const agent = this.agents.get(agentId)
     if (!agent?.client) return []
@@ -803,23 +1120,29 @@ export class AgentManager extends EventEmitter {
 
   // ---------- Checkpoints (Approval & Rollback) ----------
 
-  async createCheckpoint(agent: Agent, label: string): Promise<Checkpoint | null> {
+  async createCheckpoint(chat: Agent, label: string, keep?: string): Promise<Checkpoint | null> {
+    // Checkpoints belong to the project, so every parallel chat shares one list.
+    const agent = this.primaryOf(chat)
     if (!(await isGitRepo(agent.path))) return null
     try {
-      const files = await changedFiles(agent.path)
-      const sha = await commitAll(agent.path, `[prime-desktop] ${label} checkpoint`)
-      if (!sha) return null
+      const previous = agent.checkpoints.at(-1)?.id ?? null
+      const snapshot = await createCheckpointSnapshot(agent.path, `[prime-desktop] ${label} checkpoint`, previous)
+      if (!snapshot) return null
       const cp: Checkpoint = {
-        id: sha,
+        id: snapshot.sha,
         createdAt: Date.now(),
         label,
         agentId: agent.id,
-        dirtyFiles: files
+        dirtyFiles: await changedFiles(agent.path)
       }
       agent.checkpoints.push(cp)
-      if (agent.checkpoints.length > 50) agent.checkpoints.shift()
       await mkdir(CHECKPOINT_DIR, { recursive: true })
-      await writeFile(join(CHECKPOINT_DIR, `${sha}.json`), JSON.stringify(cp, null, 2))
+      await writeFile(join(CHECKPOINT_DIR, `${cp.id}.json`), JSON.stringify(cp, null, 2))
+      while (agent.checkpoints.length > 50) {
+        const [dropped] = agent.checkpoints.splice(agent.checkpoints.findIndex((item) => item.id !== keep), 1)
+        await deleteCheckpointRef(agent.path, dropped.id)
+        await rm(join(CHECKPOINT_DIR, `${dropped.id}.json`), { force: true }).catch(() => {})
+      }
       return cp
     } catch {
       return null
@@ -848,20 +1171,38 @@ export class AgentManager extends EventEmitter {
       }
       return []
     }
-    return agent.checkpoints
+    return this.primaryOf(agent).checkpoints
   }
 
-  async restoreCheckpoint(agentId: string, sha: string): Promise<boolean> {
-    const agent = this.agents.get(agentId)
-    if (!agent) throw new Error('Agent not connected')
-    await checkoutCommit(agent.path, sha)
+  async restoreCheckpoint(agentId: string, sha: unknown): Promise<boolean> {
+    const chat = this.agents.get(agentId)
+    if (!chat) throw new Error('Agent not connected')
+    const agent = this.primaryOf(chat)
+    if (!isCheckpointId(sha)) throw new Error('Invalid checkpoint id')
+    if (!(await this.isKnownCheckpoint(agent, sha)) || !(await checkpointExists(agent.path, sha))) {
+      throw new Error('Unknown checkpoint for this project')
+    }
+    // Restoring deletes files created since the snapshot; keep the current
+    // state recoverable as its own checkpoint first.
+    await this.createCheckpoint(agent, 'before-restore', sha)
+    await restoreCheckpointSnapshot(agent.path, sha)
     return true
+  }
+
+  private async isKnownCheckpoint(agent: Agent, sha: string): Promise<boolean> {
+    if (agent.checkpoints.some((checkpoint) => checkpoint.id === sha)) return true
+    try {
+      const stored = JSON.parse(await readFile(join(CHECKPOINT_DIR, `${sha}.json`), 'utf8')) as Partial<Checkpoint>
+      return stored.id === sha && stored.agentId === agent.id
+    } catch {
+      return false
+    }
   }
 
   async diffFiles(agentId: string): Promise<FileDiff[]> {
     const agent = this.agents.get(agentId)
     if (!agent) throw new Error('Agent not connected')
-    if (!(await isGitRepo(agent.path))) return []
+    if (!(await isGitRepo(agent.path))) return snapshotFileChanges(agent.path)
     const st = await statusShort(agent.path)
     const out: FileDiff[] = []
     for (const s of st) {
@@ -960,9 +1301,7 @@ export class AgentManager extends EventEmitter {
     await setSettings({ autonomous: config })
     const agent = agentId ? this.agents.get(agentId) : undefined
     if (patch.enabled !== undefined && agent?.client?.running) {
-      await agent.client.withConnection((connection) =>
-        connection.prompt(`/autonomous ${patch.enabled ? 'on' : 'off'}`)
-      ).catch(() => {})
+      await agent.client.send({ type: 'prompt', message: `/autonomous ${patch.enabled ? 'on' : 'off'}` }).catch(() => {})
     }
     return this.getAutonomy(agentId)
   }
@@ -1135,6 +1474,16 @@ export class AgentManager extends EventEmitter {
   }
 
   async harnessAction(agentId: string, action: string, input: Record<string, unknown> = {}): Promise<unknown> {
+    if (action === 'mcp_catalog') return getMcpCatalog(this.binary.getBinary())
+    if (action === 'model_roles') return getModelRoles()
+    if (action === 'model_role_set') {
+      const roles = await setModelRole(String(input.key ?? ''), String(input.value ?? ''))
+      for (const agent of this.agents.values()) {
+        if (agent.info.isStreaming) agent.pendingRuntimeReload = true
+        else if (agent.client?.running) await agent.client.send({ type: 'reload' })
+      }
+      return roles
+    }
     if (action === 'traces') {
       const mode = String(input.mode ?? 'status')
       if (mode === 'on' || mode === 'off') await setAgentTracesEnabled(mode === 'on')
@@ -1264,7 +1613,18 @@ export class AgentManager extends EventEmitter {
           case 'queue':
             return {
               ...(await connection.getQueue()),
-              mutationSupported: typeof connection.mutateQueuedMessage === 'function'
+              mutationSupported: typeof connection.mutateQueuedMessage === 'function',
+              sendQueuedSupported: agent.client?.supports('abort_and_send_queued') === true
+            }
+          case 'queue_send_now':
+            if (!agent.client?.supports('abort_and_send_queued') || !connection.abortAndSendQueued) {
+              throw new Error('Restart with the updated Prime Agent to send queued messages now.')
+            }
+            await connection.abortAndSendQueued()
+            return {
+              ...(await connection.getQueue()),
+              mutationSupported: typeof connection.mutateQueuedMessage === 'function',
+              sendQueuedSupported: true
             }
           case 'queue_mutate': {
             if (!connection.mutateQueuedMessage) return { status: 'unsupported', ...(await connection.getQueue()) }
@@ -1374,10 +1734,10 @@ export class AgentManager extends EventEmitter {
           case 'goal_state':
             return { goal: (await connection.getState()).goal }
           case 'goal_command':
-            await connection.prompt(String(input.command ?? '/goal status'))
+            await agent.client!.send({ type: 'prompt', message: String(input.command ?? '/goal status') })
             return { accepted: true }
           case 'autonomous_command':
-            await connection.prompt(`/autonomous ${String(input.mode ?? 'status')}`)
+            await agent.client!.send({ type: 'prompt', message: `/autonomous ${String(input.mode ?? 'status')}` })
             return { accepted: true }
           case 'heartbeats':
             return { heartbeats: await connection.listHeartbeats() }
@@ -1506,6 +1866,11 @@ export class AgentManager extends EventEmitter {
   }
 
   shutdownAll(): void {
+    // Extra chat slots that are still running keep going as resident daemon
+    // sessions, the same as the primary chat; idle ones are stopped.
+    for (const a of this.agents.values()) {
+      if (a.id !== primaryAgentId(a.tabId) && this.isIdle(a)) void a.client?.release().catch(() => {})
+    }
     for (const a of this.agents.values()) a.client?.kill()
     for (const o of this.observers.values()) o.kill()
     this.agents.clear()
@@ -1516,6 +1881,7 @@ export class AgentManager extends EventEmitter {
     return [...this.agents.values()].map((a) => a.info)
   }
 }
+
 
 function flattenTree(
   roots: DaemonTreeNode[],
@@ -1540,11 +1906,29 @@ function flattenTree(
 }
 
 async function localModelCatalog(): Promise<ReturnType<typeof parseModelList>> {
+  // Offline fallback only — the live daemon catalog is authoritative. Merge
+  // every local source: a models.json with a single custom provider must not
+  // hide the recent models the user actually cycles through.
+  const merged = new Map<string, ReturnType<typeof parseModelList>[number]>()
   try {
-    return parseModelList(JSON.parse(await readFile(MODELS_FILE, 'utf8')))
+    const configured = parseModelList(JSON.parse(await readFile(MODELS_FILE, 'utf8')))
+    for (const model of configured) merged.set(model.key, model)
   } catch {
-    return []
+    // models.json may not exist yet.
   }
+  try {
+    const settings = JSON.parse(await readFile(join(homedir(), '.prime', 'agent', 'settings.json'), 'utf8')) as Record<string, unknown>
+    const recent = Array.isArray(settings.recentModels) ? settings.recentModels : []
+    const provider = typeof settings.defaultProvider === 'string' ? settings.defaultProvider : ''
+    const model = typeof settings.defaultModel === 'string' ? settings.defaultModel : ''
+    const fallback = [...(model ? [provider ? `${provider}/${model}` : model] : []), ...recent]
+    for (const parsed of parseModelList(fallback)) {
+      if (!merged.has(parsed.key)) merged.set(parsed.key, parsed)
+    }
+  } catch {
+    // Settings may be unreadable; models.json entries alone are still useful.
+  }
+  return [...merged.values()]
 }
 
 function extractSessionText(content: unknown): string {
@@ -1560,4 +1944,37 @@ function sessionTitle(text: string): string | null {
   if (!text) return null
   const oneLine = text.replace(/\s+/g, ' ').trim()
   return oneLine.length > 58 ? `${oneLine.slice(0, 57).trimEnd()}…` : oneLine
+}
+
+// Opening a chat appends model, thinking-level and state records to its file,
+// so file mtime moves a chat to the top just for being viewed. Order chats by
+// the last prompt the user actually sent instead.
+export function lastPromptAt(records: Record<string, unknown>[]): number | null {
+  for (let index = records.length - 1; index >= 0; index--) {
+    const record = records[index]
+    if (record.type !== 'message') continue
+    const message = record.message as Record<string, unknown> | undefined
+    if (message?.role !== 'user') continue
+    if (typeof message.timestamp === 'number' && Number.isFinite(message.timestamp)) return message.timestamp
+    const parsed = Date.parse(String(record.timestamp ?? ''))
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return null
+}
+
+const MAX_CHATS_PER_PROJECT = 6
+
+function primaryAgentId(tabId: string): string {
+  return `agent-${tabId}`
+}
+
+async function readSessionId(sessionPath: string): Promise<string | null> {
+  try {
+    const firstLine = (await readFile(sessionPath, 'utf8')).split('\n', 1)[0]
+    const header = JSON.parse(firstLine) as Record<string, unknown>
+    const id = header.id ?? header.sessionId
+    return typeof id === 'string' && id ? id : null
+  } catch {
+    return null
+  }
 }

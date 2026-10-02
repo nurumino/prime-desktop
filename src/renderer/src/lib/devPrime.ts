@@ -114,7 +114,6 @@ export function installDevPrime(): void {
     terminalRestart: async () => ({ running: true, pid: 1, buffer: '$ ', cwd: '/workspace/prime', offset: 2 }),
     terminalClear: async () => null,
     terminalClose: async () => null,
-    permissionsList: async () => [{ pattern: 'npm run *', action: 'allow', scope: 'project', projectPath: '/workspace/prime' }],
     dashboardSpend: async () => ({ points: [{ date: '2026-08-08', cost: 0.12, tokensIn: 32000, tokensOut: 9000 }, { date: '2026-08-09', cost: 0.08, tokensIn: 21000, tokensOut: 7000 }], totals: { cost: 0.2, tokensIn: 53000, tokensOut: 16000 } }),
     dashboardModels: async () => ['openai-codex/gpt-5.6-sol'],
     autonomyGet: async () => ({ config: { enabled: false, gates: ['npm run typecheck'], gateRetries: 2, maxContinuations: 4, maxTurns: 20, maxTokens: 120000, maxSeconds: 3600 }, progress: {} }),

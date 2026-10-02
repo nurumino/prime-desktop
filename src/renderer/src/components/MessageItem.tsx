@@ -1,4 +1,6 @@
-import { useState, useMemo } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { stripInternalRunNotices } from '@shared/messageVisibility'
+import type { Artifact } from '@shared/types'
 import type { Block, FleetEntry, RenderMessage, ToolExecState } from '../lib/store'
 import SubagentMark from './SubagentMark'
 import WorkingMark from './WorkingMark'
@@ -10,11 +12,22 @@ interface Props {
   toolExecs: Record<string, ToolExecState>
   onOpenSubagent?: (entry: FleetEntry) => void
   showReasoning?: boolean
+  artifacts?: Artifact[]
+  onOpenArtifacts?: (path?: string) => void
+  isLast?: boolean
+  turnComplete?: boolean
+  fileEditsAtEnd?: Block[]
 }
 
 /* ─── Helpers ──────────────────────────────────────────── */
 
 type ToolCategory = 'file-edit' | 'file-create' | 'file-read' | 'shell' | 'search' | 'other'
+const TOOL_OUTPUT_PREVIEW_LIMIT = 8_000
+
+function outputPreview(output: string): string {
+  if (output.length <= TOOL_OUTPUT_PREVIEW_LIMIT) return output
+  return `${output.slice(0, TOOL_OUTPUT_PREVIEW_LIMIT)}\n… output truncated …`
+}
 
 function codeFromArgs(args: unknown): string {
   if (typeof args === 'string') return args
@@ -173,11 +186,51 @@ function CopyIcon(): JSX.Element {
   )
 }
 
-function ChevronIcon({ open }: { open: boolean }): JSX.Element {
+function ChevronIcon({ open, className }: { open: boolean; className?: string }): JSX.Element {
   return (
-    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" style={{ transform: open ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.15s ease' }}>
-      <polyline points="6 9 12 15 18 9" />
+    <svg className={className} viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" style={{ transform: open ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s ease' }}>
+      <polyline points="9 6 15 12 9 18" />
     </svg>
+  )
+}
+
+export function formatWorkDuration(durationMs: number): string {
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes > 0) return `${minutes}m ${seconds}s`
+  return `${seconds}s`
+}
+
+export function WorkDurationRow({
+  startedAt,
+  durationMs,
+  active = false
+}: {
+  startedAt?: number
+  durationMs?: number
+  active?: boolean
+}): JSX.Element | null {
+  const [now, setNow] = useState(() => Date.now())
+  const isRunning = active && startedAt != null && durationMs == null
+
+  useEffect(() => {
+    if (!isRunning) return
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [isRunning, startedAt])
+
+  if (durationMs == null && startedAt == null) return null
+  const elapsed = durationMs ?? (startedAt == null ? 0 : Math.max(0, now - startedAt))
+
+  return (
+    <div className="work-duration-row" role="status" aria-live={isRunning ? 'polite' : undefined}>
+      <span>{isRunning ? 'Working for' : 'Worked for'} {formatWorkDuration(elapsed)}</span>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <polyline points="9 6 15 12 9 18" />
+      </svg>
+    </div>
   )
 }
 
@@ -237,6 +290,100 @@ interface ToolDisplayInfo {
   category: 'file-edit' | 'file-create' | 'file-read' | 'shell' | 'search' | 'other'
 }
 
+function toolDisplayInfoFromBlock(block: Block, toolExecs: Record<string, ToolExecState>): ToolDisplayInfo {
+  const live = block.id ? toolExecs[block.id] : undefined
+  const fromBlock: ToolExecState = {
+    toolCallId: block.id ?? '',
+    toolName: block.name ?? 'tool',
+    args: (block.arguments as Record<string, unknown>) ?? {},
+    output: block.result ?? '',
+    status: block.status ?? 'done',
+    isError: block.isError
+  }
+  const blockFinished = Boolean(block.result) || block.status === 'error'
+  const exec = live && !blockFinished
+    ? { ...fromBlock, ...live, output: live.output || fromBlock.output }
+    : { ...fromBlock, output: live?.output || fromBlock.output }
+  exec.reasoning = live?.reasoning ?? block.reasoning
+  return { block, exec, category: classifyTool(exec.toolName, exec.args) }
+}
+
+/** An LLM-backed tool streaming its reasoning stays open while it works, then collapses. */
+function defaultToolOpen(info: ToolDisplayInfo): boolean {
+  return info.exec.status === 'running' && Boolean(info.exec.reasoning)
+}
+
+export function isFileEditBlock(block: Block): boolean {
+  if (block.type !== 'toolCall') return false
+  const category = classifyTool(block.name ?? '', block.arguments)
+  return category === 'file-edit' || category === 'file-create'
+}
+
+function StreamText({ text, streaming, className }: { text: string; streaming: boolean; className: string }): JSX.Element {
+  const ref = useRef<HTMLPreElement>(null)
+  useEffect(() => {
+    const el = ref.current
+    if (streaming && el) el.scrollTop = el.scrollHeight
+  }, [text, streaming])
+  return <pre ref={ref} className={className}>{outputPreview(text)}</pre>
+}
+
+function ToolSection({ label, open, onToggle, meta, children }: {
+  label: string
+  open: boolean
+  onToggle: () => void
+  meta?: string
+  children: React.ReactNode
+}): JSX.Element {
+  return (
+    <div className="tool-section">
+      <button type="button" className="tool-section-head" aria-expanded={open} onClick={onToggle}>
+        <ChevronIcon open={open} />
+        <span>{label}</span>
+        {meta && <span className="tool-section-meta">{meta}</span>}
+      </button>
+      {open && children}
+    </div>
+  )
+}
+
+/** Detail view for tools that stream a reasoning trace alongside their response. */
+function GenerationDetail({ exec }: { exec: ToolExecState }): JSX.Element {
+  const running = exec.status === 'running'
+  const [reasoningOverride, setReasoningOverride] = useState<boolean | null>(null)
+  const [responseOverride, setResponseOverride] = useState<boolean | null>(null)
+  // Follow the stream: reasoning is open until the response starts arriving.
+  const reasoningOpen = reasoningOverride ?? (running && !exec.output)
+  const responseOpen = responseOverride ?? true
+  const reasoning = exec.reasoning ?? ''
+  return (
+    <div className="tool-inline-detail">
+      {reasoning && (
+        <ToolSection
+          label="Reasoning"
+          open={reasoningOpen}
+          onToggle={() => setReasoningOverride(!reasoningOpen)}
+          meta={running && !exec.output ? 'thinking…' : `${reasoning.length.toLocaleString()} chars`}
+        >
+          <StreamText text={reasoning} streaming={running && !exec.output} className="tool-inline-output tool-reasoning" />
+        </ToolSection>
+      )}
+      {(exec.output || running) && (
+        <ToolSection
+          label="Response"
+          open={responseOpen}
+          onToggle={() => setResponseOverride(!responseOpen)}
+          meta={running && exec.output ? 'streaming…' : undefined}
+        >
+          {exec.output
+            ? <StreamText text={exec.output} streaming={running} className="tool-inline-output" />
+            : <div className="tool-inline-output tool-section-empty">Waiting for the model…</div>}
+        </ToolSection>
+      )}
+    </div>
+  )
+}
+
 function InlineToolItem({ info, isOpen, onToggle }: { info: ToolDisplayInfo; isOpen: boolean; onToggle: () => void }): JSX.Element {
   const { exec, category } = info
   const isRunning = exec.status === 'running'
@@ -250,19 +397,19 @@ function InlineToolItem({ info, isOpen, onToggle }: { info: ToolDisplayInfo; isO
       const verb = category === 'file-create' ? 'Created' : 'Edited'
       return (
         <div className={`tool-inline ${isError ? 'error' : ''}`}>
-          <div className="tool-inline-row" onClick={onToggle}>
+          <button type="button" className="tool-inline-row" aria-expanded={isOpen} onClick={onToggle}>
             <div className="tool-inline-left">
               {isRunning ? <RunningMark /> : <PencilIcon />}
               <span className="tool-inline-verb">{verb}</span>
               <span className="tool-inline-filename">{filename || exec.toolName}</span>
               {stats && <DiffStat added={stats.added} removed={stats.removed} />}
               {isError && <span className="tool-inline-error-dot">●</span>}
+              {exec.output && <ChevronIcon className="tool-inline-chevron" open={isOpen} />}
             </div>
-            {exec.output && <ChevronIcon open={isOpen} />}
-          </div>
+          </button>
           {isOpen && exec.output && (
             <div className="tool-inline-detail">
-              <pre className="tool-inline-output">{exec.output}</pre>
+              <pre className="tool-inline-output">{outputPreview(exec.output)}</pre>
             </div>
           )}
         </div>
@@ -273,17 +420,17 @@ function InlineToolItem({ info, isOpen, onToggle }: { info: ToolDisplayInfo; isO
       const filename = extractFilename(exec.args)
       return (
         <div className={`tool-inline ${isError ? 'error' : ''}`}>
-          <div className="tool-inline-row" onClick={onToggle}>
+          <button type="button" className="tool-inline-row" aria-expanded={isOpen} onClick={onToggle}>
             <div className="tool-inline-left">
               {isRunning ? <RunningMark /> : <FileIcon />}
               <span className="tool-inline-verb">Read</span>
               <span className="tool-inline-filename">{filename || exec.toolName}</span>
+              {exec.output && <ChevronIcon className="tool-inline-chevron" open={isOpen} />}
             </div>
-            {exec.output && <ChevronIcon open={isOpen} />}
-          </div>
+          </button>
           {isOpen && exec.output && (
             <div className="tool-inline-detail">
-              <pre className="tool-inline-output">{exec.output.slice(0, 2000)}</pre>
+              <pre className="tool-inline-output">{outputPreview(exec.output)}</pre>
             </div>
           )}
         </div>
@@ -295,19 +442,19 @@ function InlineToolItem({ info, isOpen, onToggle }: { info: ToolDisplayInfo; isO
       const truncCmd = cmd.length > 60 ? cmd.slice(0, 60) + '\u2026' : cmd
       return (
         <div className={`tool-inline ${isError ? 'error' : ''}`}>
-          <div className="tool-inline-row" onClick={onToggle}>
+          <button type="button" className="tool-inline-row" aria-expanded={isOpen} onClick={onToggle}>
             <div className="tool-inline-left">
               {isRunning ? <RunningMark /> : <TerminalIcon />}
               <span className="tool-inline-verb">Ran</span>
               <code className="tool-inline-cmd">{truncCmd || exec.toolName}</code>
               {isError && <span className="tool-inline-error-dot">●</span>}
+              <ChevronIcon className="tool-inline-chevron" open={isOpen} />
             </div>
-            <ChevronIcon open={isOpen} />
-          </div>
+          </button>
           {isOpen && (
             <div className="tool-inline-detail">
               {cmd.length > 60 && <code className="tool-inline-full-cmd">{cmd}</code>}
-              {exec.output && <pre className="tool-inline-output">{exec.output}</pre>}
+              {exec.output && <pre className="tool-inline-output">{outputPreview(exec.output)}</pre>}
             </div>
           )}
         </div>
@@ -318,17 +465,17 @@ function InlineToolItem({ info, isOpen, onToggle }: { info: ToolDisplayInfo; isO
       const query = extractQuery(exec.args)
       return (
         <div className={`tool-inline ${isError ? 'error' : ''}`}>
-          <div className="tool-inline-row" onClick={onToggle}>
+          <button type="button" className="tool-inline-row" aria-expanded={isOpen} onClick={onToggle}>
             <div className="tool-inline-left">
               {isRunning ? <RunningMark /> : <GlobeIcon />}
               <span className="tool-inline-verb">Searched the web for</span>
               <span className="tool-inline-query">{query}</span>
+              {exec.output && <ChevronIcon className="tool-inline-chevron" open={isOpen} />}
             </div>
-            {exec.output && <ChevronIcon open={isOpen} />}
-          </div>
+          </button>
           {isOpen && exec.output && (
             <div className="tool-inline-detail">
-              <pre className="tool-inline-output">{exec.output.slice(0, 3000)}</pre>
+              <pre className="tool-inline-output">{outputPreview(exec.output)}</pre>
             </div>
           )}
         </div>
@@ -339,18 +486,19 @@ function InlineToolItem({ info, isOpen, onToggle }: { info: ToolDisplayInfo; isO
       const filename = extractFilename(exec.args) || extractCommand(exec.args) || extractQuery(exec.args)
       return (
         <div className={`tool-inline ${isError ? 'error' : ''}`}>
-          <div className="tool-inline-row" onClick={onToggle}>
+          <button type="button" className="tool-inline-row" aria-expanded={isOpen} onClick={onToggle}>
             <div className="tool-inline-left">
               {isRunning ? <RunningMark /> : <ToolIcon />}
               <span className="tool-inline-verb">{exec.toolName}</span>
               {filename && <span className="tool-inline-filename">{filename}</span>}
               {isError && <span className="tool-inline-error-dot">●</span>}
+              {(exec.output || exec.reasoning) && <ChevronIcon className="tool-inline-chevron" open={isOpen} />}
             </div>
-            {exec.output && <ChevronIcon open={isOpen} />}
-          </div>
-          {isOpen && exec.output && (
+          </button>
+          {isOpen && exec.reasoning && <GenerationDetail exec={exec} />}
+          {isOpen && !exec.reasoning && exec.output && (
             <div className="tool-inline-detail">
-              <pre className="tool-inline-output">{exec.output.slice(0, 3000)}</pre>
+              <pre className="tool-inline-output">{outputPreview(exec.output)}</pre>
             </div>
           )}
         </div>
@@ -392,6 +540,90 @@ function SubagentReplyItem({ block, onOpen }: { block: Block; onOpen: (entry: Fl
   )
 }
 
+export function parseAutoRefinementText(text: string): { summary: string; detail: string } | null {
+  const marker = text.match(/\[(?:(?:auto|self|user)-)?refinement\]/)
+  if (!marker) return null
+  const before = text.slice(0, marker.index).trim()
+  if (before && !/^Refinement complete:/i.test(before)) return null
+  const detail = text.slice((marker.index ?? 0) + marker[0].length).trim()
+  if (!detail) return null
+  const summary = before.replace(/^Refinement complete:\s*/i, '').trim() || detail.split(/\n| - (?:create|update|delete) (?:memory|prompt|skill|subagent)/i)[0].trim()
+  return { summary, detail }
+}
+
+export function parseRefinementMemories(detail: string): { intro: string; memories: { action: string; kind: string; name: string; scope?: 'local' | 'global'; text: string }[] } {
+  const matches = [...detail.matchAll(/(?:^|\s)- (create|update|delete) (memory|prompt|skill|subagent) \[([^\]]+)\]/g)]
+  return {
+    intro: detail.slice(0, matches[0]?.index ?? detail.length).trim(),
+    memories: matches.map((match, index) => {
+      const scope = match[3].match(/^(local|global):/)?.[1] as 'local' | 'global' | undefined
+      return {
+        action: match[1],
+        kind: match[2],
+        name: match[3].replace(/^(?:local|global):/, ''),
+        ...(scope ? { scope } : {}),
+        text: detail.slice((match.index ?? 0) + match[0].length, matches[index + 1]?.index ?? detail.length).trim()
+      }
+    })
+  }
+}
+
+const REFINEMENT_VERBS: Record<string, string> = { create: 'Added', update: 'Updated', delete: 'Removed' }
+
+// Refinement is background housekeeping, so it reads as one quiet activity
+// row like tool calls rather than a card competing with the answer.
+function AutoRefinementCard({ summary, detail }: { summary: string; detail: string }): JSX.Element {
+  const { intro, memories } = parseRefinementMemories(detail)
+  const [open, setOpen] = useState(false)
+  return (
+    <details className="refinement-message-card" onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary className="disclosure-head">
+        <span className="refinement-message-icon" aria-hidden="true">✦</span>
+        <span className="disclosure-label">Harness refined</span>
+        <span className="disclosure-meta">{summary}</span>
+        {memories.length > 0 && <span className="disclosure-count">{memories.length} {memories.length === 1 ? 'change' : 'changes'}</span>}
+        <ChevronIcon className="disclosure-chevron" open={open} />
+      </summary>
+      <div className="disclosure-body refinement-message-detail">
+        {intro && <p>{intro}</p>}
+        {memories.length > 0 ? memories.map((memory, index) => (
+          <div className="refinement-memory" key={`${memory.name}-${index}`}>
+            <span className="refinement-memory-head">
+              <span className={`refinement-action ${memory.action}`}>{REFINEMENT_VERBS[memory.action] ?? memory.action} {memory.kind}</span>
+              <code>{memory.name}</code>
+              {memory.scope && <span className="refinement-scope">{memory.scope}</span>}
+            </span>
+            <span>{memory.text}</span>
+          </div>
+        )) : !intro ? detail : null}
+      </div>
+    </details>
+  )
+}
+
+function ReasoningBlock({ text, streaming, onOpenFile }: { text: string; streaming: boolean; onOpenFile?: (path?: string) => void }): JSX.Element {
+  const [override, setOverride] = useState<boolean | null>(null)
+  // Follow the stream while the model is thinking, then fold away so the
+  // answer stays the focus. A manual toggle always wins.
+  const open = override ?? streaming
+  const preview = text.replace(/\s+/g, ' ').trim()
+  return (
+    <div className={`reasoning-block ${open ? 'open' : ''}`}>
+      <button type="button" className="disclosure-head" aria-expanded={open} onClick={() => setOverride(!open)}>
+        <span className="disclosure-label">{streaming ? 'Thinking' : 'Reasoning'}</span>
+        {!open && <span className="disclosure-meta">{preview}</span>}
+        <ChevronIcon className="disclosure-chevron" open={open} />
+      </button>
+      {open && (
+        <div className="disclosure-body thinking-trace">
+          <Markdown text={text} onOpenFile={onOpenFile} />
+          {streaming && <span className="caret">{'\u258D'}</span>}
+        </div>
+      )}
+    </div>
+  )
+}
+
 /* ─── Grouped file edits ──────────────────────────────── */
 
 function EditedFilesGroup({ items, openTools, onToggle }: {
@@ -399,6 +631,7 @@ function EditedFilesGroup({ items, openTools, onToggle }: {
   openTools: Record<string, boolean>
   onToggle: (id: string) => void
 }): JSX.Element {
+  const [open, setOpen] = useState(true)
   const [expanded, setExpanded] = useState(false)
   const VISIBLE_COUNT = 3
 
@@ -418,40 +651,39 @@ function EditedFilesGroup({ items, openTools, onToggle }: {
 
   return (
     <div className="edited-files-group">
-      <div className="edited-files-header" onClick={() => setExpanded((v) => !v)}>
-        <div className="edited-files-header-left">
-          <PencilIcon />
-          <span className="edited-files-title">Edited {items.length} files</span>
-          <DiffStat added={totalStats.added} removed={totalStats.removed} />
-        </div>
-        <div className="edited-files-header-right">
-          <ChevronIcon open={expanded} />
-        </div>
-      </div>
+      <button type="button" className="disclosure-head" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+        <PencilIcon />
+        <span className="disclosure-label">Edited {items.length} files</span>
+        <DiffStat added={totalStats.added} removed={totalStats.removed} />
+        <ChevronIcon className="disclosure-chevron" open={open} />
+      </button>
 
-      {expanded && (
-        <div className="edited-files-list">
-          {visibleItems.map((info) => {
-            const filename = extractFilename(info.exec.args)
-            const fullPath = extractFullPath(info.exec.args)
-            const stats = info.exec.output ? parseDiffStats(info.exec.output) : null
-            const displayPath = fullPath.includes('/src/') ? fullPath.split('/src/').pop()! : filename
+      {open && <div className="edited-files-list disclosure-body">
+        {visibleItems.map((info) => {
+          const filename = extractFilename(info.exec.args)
+          const fullPath = extractFullPath(info.exec.args)
+          const stats = info.exec.output ? parseDiffStats(info.exec.output) : null
+          const displayPath = fullPath.includes('/src/') ? fullPath.split('/src/').pop()! : filename
 
-            return (
-              <div key={info.block.id} className="edited-file-row">
-                <span className="edited-file-path">{displayPath || filename}</span>
-                {stats && <DiffStat added={stats.added} removed={stats.removed} />}
-              </div>
-            )
-          })}
+          return (
+            <div key={info.block.id} className="edited-file-row">
+              <span className="edited-file-path">{displayPath || filename}</span>
+              {stats && <DiffStat added={stats.added} removed={stats.removed} />}
+            </div>
+          )
+        })}
 
-          {!expanded && remainingCount > 0 && (
-            <button className="edited-files-more" onClick={() => setExpanded(true)}>
-              Show {remainingCount} more file{remainingCount > 1 ? 's' : ''} <ChevronIcon open={false} />
-            </button>
-          )}
-        </div>
-      )}
+        {!expanded && remainingCount > 0 && (
+          <button type="button" className="edited-files-more" onClick={() => setExpanded(true)}>
+            Show {remainingCount} more file{remainingCount > 1 ? 's' : ''} <ChevronIcon open={false} />
+          </button>
+        )}
+        {expanded && remainingCount > 0 && (
+          <button type="button" className="edited-files-more" onClick={() => setExpanded(false)}>
+            Show less <ChevronIcon open />
+          </button>
+        )}
+      </div>}
     </div>
   )
 }
@@ -501,11 +733,13 @@ function UserBubble({ text, isLong, timestamp }: { text: string; isLong: boolean
 
 /* ─── Main MessageItem ────────────────────────────────── */
 
-export default function MessageItem({ message, toolExecs, onOpenSubagent, showReasoning = true }: Props): JSX.Element {
+export default function MessageItem({ message, toolExecs, onOpenSubagent, showReasoning = true, artifacts = [], onOpenArtifacts, isLast = true, turnComplete = true, fileEditsAtEnd }: Props): JSX.Element {
   const [openTools, setOpenTools] = useState<Record<string, boolean>>({})
   const [copied, setCopied] = useState(false)
+  const [artifactsExpanded, setArtifactsExpanded] = useState(false)
+  const [collapsedToolGroups, setCollapsedToolGroups] = useState<Record<string, boolean>>({})
 
-  const toggleTool = (id: string) => setOpenTools((o) => ({ ...o, [id]: !o[id] }))
+  const toggleTool = (id: string, fallback = false) => setOpenTools((o) => ({ ...o, [id]: !(o[id] ?? fallback) }))
 
   if (message.role === 'user') {
     const text = typeof message.content === 'string'
@@ -521,16 +755,29 @@ export default function MessageItem({ message, toolExecs, onOpenSubagent, showRe
   }
 
   if (message.role === 'system') {
-    const isCompaction = (message as unknown as Record<string, unknown>).compaction === true
+    const rawId = String((message as unknown as Record<string, unknown>).id ?? '')
+    const isCompaction = rawId.startsWith('sys-compaction_outcome')
+      || (message as unknown as Record<string, unknown>).compaction === true
       || (typeof message.content === 'string' && message.content.toLowerCase().includes('compacted'))
+    if (isCompaction) {
+      return (
+        <div className="compaction-card">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 4v5H4M15 20v-5h5M15 4v5h5M9 20v-5H4M12 9V3M12 21v-6M3 12h6M21 12h-6" />
+          </svg>
+          <span>
+            <strong>Context compacted</strong>
+            {typeof message.content === 'string' && message.content.trim() && !/^context (automatically )?compacted\.?$/i.test(message.content.trim())
+              ? ` — ${message.content.replace(/^Context automatically compacted\.?\s*/i, '').trim()}`
+              : ' — older history was summarized to free window space'}
+          </span>
+        </div>
+      )
+    }
     return (
       <div className="sys-msg">
         <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.8">
-          {isCompaction ? (
-            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 11-.57-8.38" />
-          ) : (
-            <path d="M4 7h16M4 12h10M4 17h7" />
-          )}
+          <path d="M4 7h16M4 12h10M4 17h7" />
         </svg>
         <span>{typeof message.content === 'string' ? message.content : 'Command'}</span>
       </div>
@@ -546,55 +793,50 @@ export default function MessageItem({ message, toolExecs, onOpenSubagent, showRe
   const toolInfos = useMemo(() => {
     return blocks
       .filter((b) => b.type === 'toolCall')
-      .map((b) => {
-        const live = b.id ? toolExecs[b.id] : undefined
-        const fromBlock: ToolExecState = {
-          toolCallId: b.id ?? '',
-          toolName: b.name ?? 'tool',
-          args: (b.arguments as Record<string, unknown>) ?? {},
-          output: b.result ?? '',
-          status: b.status ?? 'done',
-          isError: b.isError
-        }
-        const blockFinished = Boolean(b.result) || b.status === 'error'
-        const exec: ToolExecState = live && !blockFinished
-          ? { ...fromBlock, ...live, output: live.output || fromBlock.output }
-          : { ...fromBlock, output: live?.output || fromBlock.output }
-        return { block: b, exec, category: classifyTool(exec.toolName, exec.args) } as ToolDisplayInfo
-      })
+      .map((b) => toolDisplayInfoFromBlock(b, toolExecs))
   }, [blocks, toolExecs])
 
+  const deferredFileEditInfos = useMemo(() => {
+    const source = fileEditsAtEnd ?? blocks.filter(isFileEditBlock)
+    return source.filter(isFileEditBlock).map((block) => toolDisplayInfoFromBlock(block, toolExecs))
+  }, [blocks, fileEditsAtEnd, toolExecs])
+
   const renderGroups = useMemo(() => {
-    const groups: Array<{ type: 'text' | 'thinking' | 'tool' | 'file-edit-group' | 'subagent'; block?: Block; tools?: ToolDisplayInfo[]; toolInfo?: ToolDisplayInfo }> = []
+    const groups: Array<{ type: 'text' | 'thinking' | 'tool' | 'file-edit-group' | 'subagent' | 'refinement'; block?: Block; tools?: ToolDisplayInfo[]; toolInfo?: ToolDisplayInfo; refinement?: { summary: string; detail: string } }> = []
     let toolIndex = 0
 
     for (const b of blocks) {
-      if (b.type === 'text' && b.text && b.text.trim()) {
-        groups.push({ type: 'text', block: b })
-      } else if (showReasoning && b.type === 'thinking' && b.thinking) {
-        groups.push({ type: 'thinking', block: b })
+      if (b.type === 'text' && b.text && parseAutoRefinementText(b.text)) {
+        const previous = groups[groups.length - 1]
+        const combined = previous?.type === 'text' && previous.block?.text?.startsWith('Refinement complete:')
+          ? parseAutoRefinementText(`${previous.block.text}\n\n${b.text}`)
+          : null
+        if (combined) groups.pop()
+        groups.push({ type: 'refinement', refinement: combined ?? parseAutoRefinementText(b.text)! })
+      } else if (b.type === 'text' && b.text && stripInternalRunNotices(b.text)) {
+        groups.push({ type: 'text', block: { ...b, text: stripInternalRunNotices(b.text) } })
+      } else if (showReasoning && b.type === 'thinking' && b.thinking && stripInternalRunNotices(b.thinking)) {
+        groups.push({ type: 'thinking', block: { ...b, thinking: stripInternalRunNotices(b.thinking) } })
       } else if (b.type === 'subagent') {
         groups.push({ type: 'subagent', block: b })
       } else if (b.type === 'toolCall') {
         const info = toolInfos[toolIndex++]
         if (!info) continue
 
-        if (info.category === 'file-edit' || info.category === 'file-create') {
-          const last = groups[groups.length - 1]
-          if (last && last.type === 'file-edit-group' && last.tools) {
-            last.tools.push(info)
-          } else {
-            groups.push({ type: 'file-edit-group', tools: [info] })
-          }
-        } else {
-          groups.push({ type: 'tool', toolInfo: info })
-        }
+        const previous = groups[groups.length - 1]
+        if (previous?.type === 'tool') previous.tools!.push(info)
+        else groups.push({ type: 'tool', tools: [info] })
       }
     }
+    if (turnComplete && deferredFileEditInfos.length > 0) {
+      groups.push({ type: 'file-edit-group', tools: deferredFileEditInfos })
+    }
     return groups
-  }, [blocks, toolInfos, showReasoning])
+  }, [blocks, deferredFileEditInfos, showReasoning, toolInfos, turnComplete])
 
-  // Don't render empty assistant message containers
+  // Keep the work timer visible when reasoning is hidden. A streaming
+  // assistant message can contain only a thinking block at this point, and
+  // filtering that block must not make the whole working state disappear.
   if (renderGroups.length === 0 && !message.streaming) {
     return <></>
   }
@@ -619,7 +861,7 @@ export default function MessageItem({ message, toolExecs, onOpenSubagent, showRe
         if (group.type === 'text' && group.block) {
           return (
             <div key={i} className="msg-text">
-              <Markdown text={group.block.text ?? ''} />
+              <Markdown text={group.block.text ?? ''} onOpenFile={onOpenArtifacts} />
               {message.streaming && i === renderGroups.length - 1 && <span className="caret">{'\u258D'}</span>}
             </div>
           )
@@ -627,10 +869,12 @@ export default function MessageItem({ message, toolExecs, onOpenSubagent, showRe
 
         if (group.type === 'thinking' && group.block) {
           return (
-            <div key={i} className="thinking-trace">
-              <Markdown text={group.block.thinking ?? ''} />
-              {message.streaming && i === renderGroups.length - 1 && <span className="caret">{'\u258D'}</span>}
-            </div>
+            <ReasoningBlock
+              key={i}
+              text={group.block.thinking ?? ''}
+              streaming={Boolean(message.streaming) && i === renderGroups.length - 1}
+              onOpenFile={onOpenArtifacts}
+            />
           )
         }
 
@@ -645,18 +889,25 @@ export default function MessageItem({ message, toolExecs, onOpenSubagent, showRe
           )
         }
 
-        if (group.type === 'tool' && group.toolInfo) {
-          const id = group.toolInfo.block.id ?? ''
-          if (isRlmSpawn(group.toolInfo.exec) && onOpenSubagent) {
-            return <SubagentToolItem key={i} info={group.toolInfo} onOpen={onOpenSubagent} />
-          }
+        if (group.type === 'tool' && group.tools) {
+          const groupId = group.tools[0].block.id ?? `tools-${i}`
+          const collapsed = collapsedToolGroups[groupId] ?? false
           return (
-            <InlineToolItem
-              key={i}
-              info={group.toolInfo}
-              isOpen={openTools[id] ?? false}
-              onToggle={() => toggleTool(id)}
-            />
+            <div key={groupId} className="tool-history">
+              <button type="button" className="disclosure-head" aria-expanded={!collapsed}
+                onClick={() => setCollapsedToolGroups((current) => ({ ...current, [groupId]: !collapsed }))}>
+                <span className="disclosure-label">{group.tools.length} tool {group.tools.length === 1 ? 'call' : 'calls'}</span>
+                <ChevronIcon className="disclosure-chevron" open={!collapsed} />
+              </button>
+              {!collapsed && group.tools.map((info) => {
+                const id = info.block.id ?? ''
+                if (isRlmSpawn(info.exec) && onOpenSubagent) {
+                  return <SubagentToolItem key={id} info={info} onOpen={onOpenSubagent} />
+                }
+                const fallbackOpen = defaultToolOpen(info)
+                return <InlineToolItem key={id} info={info} isOpen={openTools[id] ?? fallbackOpen} onToggle={() => toggleTool(id, fallbackOpen)} />
+              })}
+            </div>
           )
         }
 
@@ -664,16 +915,56 @@ export default function MessageItem({ message, toolExecs, onOpenSubagent, showRe
           return <SubagentReplyItem key={i} block={group.block} onOpen={onOpenSubagent} />
         }
 
+        if (group.type === 'refinement' && group.refinement) {
+          return <AutoRefinementCard key={i} {...group.refinement} />
+        }
+
         return null
       })}
 
-      {!message.streaming && blocks.some((b) => b.type === 'text' && b.text) && (
+      {turnComplete && !message.streaming && (artifacts.length > 0 || (isLast && blocks.some((b) => b.type === 'text' && b.text))) && (
         <div className="turn-footer">
-          <button className="turn-footer-btn" onClick={copyMessage} title="Copy message">
-            <CopyIcon />
-            {copied && <span className="turn-footer-copied">Copied!</span>}
-          </button>
-          {timestamp && <span className="turn-footer-time">{timestamp}</span>}
+          {artifacts.length > 0 && (
+            <div className="artifact-footer">
+              <div className="artifact-footer-head">
+                <span className="artifact-footer-mark" aria-hidden="true">✦</span>
+                <span>{artifacts.length} file{artifacts.length === 1 ? '' : 's'} changed</span>
+              </div>
+              <div className="artifact-footer-files">
+                {artifacts.slice(0, artifactsExpanded ? artifacts.length : 4).map((artifact) => (
+                  <button
+                    key={artifact.path}
+                    className="artifact-footer-file"
+                    type="button"
+                    onClick={() => onOpenArtifacts?.(artifact.path)}
+                    title={`Preview ${artifact.path}`}
+                  >
+                    <code>{artifact.path}</code>
+                    <span className="artifact-footer-action">View</span>
+                  </button>
+                ))}
+                {artifacts.length > 4 && (
+                  <button
+                    className="artifact-footer-more"
+                    type="button"
+                    onClick={() => setArtifactsExpanded((expanded) => !expanded)}
+                  >
+                    {artifactsExpanded ? 'Show less' : `Show ${artifacts.length - 4} more`}
+                    <ChevronIcon open={artifactsExpanded} />
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+          {isLast && (
+            <>
+              <button className="turn-footer-btn" onClick={copyMessage} title="Copy message">
+                <CopyIcon />
+                {copied && <span className="turn-footer-copied">Copied!</span>}
+              </button>
+              {timestamp && <span className="turn-footer-time">{timestamp}</span>}
+            </>
+          )}
         </div>
       )}
     </div>
@@ -682,8 +973,21 @@ export default function MessageItem({ message, toolExecs, onOpenSubagent, showRe
 
 /* ─── Inline renderer — safe React, no dangerouslySetInnerHTML ── */
 
-function renderInline(text: string): (JSX.Element | string)[] {
-  const re = /(`[^`]+`|\*\*[^*]+\*\*)/g
+export function markdownLinkTarget(raw: string): { type: 'file' | 'web'; path: string } | null {
+  const target = raw.replace(/^<|>$/g, '').trim()
+  if (/^https?:\/\//i.test(target)) return { type: 'web', path: target }
+  if (target.startsWith('//') || target.startsWith('#')) return null
+  if (/^[a-z][a-z\d+.-]*:/i.test(target) && !target.startsWith('file:///')) return null
+  try {
+    const path = decodeURIComponent(target.replace(/^file:\/\//, '').split('#')[0])
+    return path ? { type: 'file', path } : null
+  } catch {
+    return null
+  }
+}
+
+function renderInline(text: string, onOpenFile?: (path?: string) => void): (JSX.Element | string)[] {
+  const re = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]\n]+\]\((?:<[^>\n]+>|[^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\))/g
   const nodes: (JSX.Element | string)[] = []
   let last = 0
   let key = 0
@@ -693,8 +997,21 @@ function renderInline(text: string): (JSX.Element | string)[] {
     const tok = m[0]
     if (tok.startsWith('`')) {
       nodes.push(<code key={key++} className="md-inline-code">{tok.slice(1, -1)}</code>)
-    } else {
+    } else if (tok.startsWith('**')) {
       nodes.push(<strong key={key++}>{tok.slice(2, -2)}</strong>)
+    } else {
+      const end = tok.indexOf('](')
+      const label = tok.slice(1, end)
+      const target = markdownLinkTarget(tok.slice(end + 2, -1))
+      if (!target || (target.type === 'file' && !onOpenFile)) nodes.push(label)
+      else nodes.push(
+        <a key={key++} className="md-link" href={target.type === 'web' ? target.path : '#'} title={target.path}
+          onClick={(event) => {
+            event.preventDefault()
+            if (target.type === 'web') void window.prime.openExternal(target.path)
+            else onOpenFile?.(target.path.endsWith('/') ? undefined : target.path)
+          }}>{label}</a>
+      )
     }
     last = m.index + tok.length
   }
@@ -704,15 +1021,52 @@ function renderInline(text: string): (JSX.Element | string)[] {
 
 /* ─── Markdown renderer — token-based, handles blank lines inside code fences ── */
 
-export function Markdown({ text }: { text: string }): JSX.Element {
+export function Markdown({ text, onOpenFile }: { text: string; onOpenFile?: (path?: string) => void }): JSX.Element {
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null)
+  const inline = (value: string) => renderInline(value, onOpenFile)
 
+  type TableToken = { headers: string[]; rows: string[][] }
   type Token =
     | { type: 'code'; lang: string; code: string; i: number }
     | { type: 'heading'; level: number; content: string; i: number }
     | { type: 'ul'; items: string[]; i: number }
     | { type: 'ol'; items: string[]; i: number }
+    | { type: 'table'; table: TableToken; i: number }
     | { type: 'para'; content: string; i: number }
+
+  const parseTableRow = (row: string): string[] => {
+    const value = row.trim().replace(/^\|/, '').replace(/\|$/, '')
+    return value.split('|').map((cell) => cell.trim())
+  }
+
+  const parseTable = (value: string): { headers: string[]; rows: string[][] } | null => {
+    const separator = value.match(/\|?[ \t]*:?-{3,}:?[ \t]*(?:\|[ \t]*:?-{3,}:?[ \t]*)+\|?/)
+    if (!separator || separator.index == null) return null
+
+    const headers = parseTableRow(value.slice(0, separator.index))
+    const separatorCells = parseTableRow(separator[0])
+    if (headers.length < 2 || separatorCells.length !== headers.length) return null
+
+    const body = value.slice(separator.index + separator[0].length).trim()
+    if (!body) return { headers, rows: [] }
+
+    const lines = body.split('\n').map((line) => line.trim()).filter(Boolean)
+    const rows = lines.length > 1
+      ? lines.map(parseTableRow).filter((row) => row.length > 0)
+      : (() => {
+          const cells = parseTableRow(body).filter(Boolean)
+          const compactRows: string[][] = []
+          for (let i = 0; i + headers.length <= cells.length; i += headers.length) {
+            compactRows.push(cells.slice(i, i + headers.length))
+          }
+          return compactRows
+        })()
+
+    return {
+      headers,
+      rows: rows.map((row) => [...row, ...Array(Math.max(0, headers.length - row.length)).fill('')].slice(0, headers.length))
+    }
+  }
 
   const tokens = useMemo<Token[]>(() => {
     const out: Token[] = []
@@ -722,21 +1076,58 @@ export function Markdown({ text }: { text: string }): JSX.Element {
     let last = 0
     let m: RegExpExecArray | null
 
-    const pushText = (chunk: string) => {
-      for (const para of chunk.split(/\n{2,}/)) {
-        const p = para.trim()
-        if (!p) continue
+    const pushPlainText = (value: string) => {
+        const p = value.trim()
+        if (!p) return
+        const table = parseTable(p)
+        if (table) { out.push({ type: 'table', table, i: n++ }); return }
         const h = p.match(/^(#{1,3})\s+(.+)/)
-        if (h) { out.push({ type: 'heading', level: h[1].length, content: h[2], i: n++ }); continue }
+        if (h) { out.push({ type: 'heading', level: h[1].length, content: h[2], i: n++ }); return }
         if (p.startsWith('- ') || p.startsWith('* ')) {
           out.push({ type: 'ul', items: p.split('\n').filter(Boolean).map((l) => l.replace(/^[-*]\s+/, '')), i: n++ })
-          continue
+          return
         }
         if (/^\d+\.\s/.test(p)) {
           out.push({ type: 'ol', items: p.split('\n').filter(Boolean).map((l) => l.replace(/^\d+\.\s+/, '')), i: n++ })
-          continue
+          return
         }
         out.push({ type: 'para', content: p, i: n++ })
+    }
+
+    const pushText = (chunk: string) => {
+      for (const para of chunk.split(/\n{2,}/)) {
+        const lines = para.split('\n')
+        let plainLines: string[] = []
+        const flushPlain = () => {
+          pushPlainText(plainLines.join('\n'))
+          plainLines = []
+        }
+
+        for (let lineIndex = 0; lineIndex < lines.length;) {
+          const line = lines[lineIndex].trim()
+          const nextLine = lines[lineIndex + 1]?.trim() ?? ''
+          const startsTable = line.startsWith('|')
+            && nextLine.startsWith('|')
+            && /^\|[ \t]*:?-{3,}:?/.test(nextLine)
+
+          if (!startsTable) {
+            plainLines.push(lines[lineIndex])
+            lineIndex++
+            continue
+          }
+
+          flushPlain()
+          const tableLines = [line, nextLine]
+          lineIndex += 2
+          while (lineIndex < lines.length && lines[lineIndex].trim().startsWith('|')) {
+            tableLines.push(lines[lineIndex].trim())
+            lineIndex++
+          }
+          const table = parseTable(tableLines.join('\n'))
+          if (table) out.push({ type: 'table', table, i: n++ })
+          else pushPlainText(tableLines.join('\n'))
+        }
+        flushPlain()
       }
     }
 
@@ -772,23 +1163,43 @@ export function Markdown({ text }: { text: string }): JSX.Element {
           )
         }
         if (tok.type === 'heading') {
-          return <div key={tok.i} className={`md-h${tok.level}`}>{renderInline(tok.content)}</div>
+          return <div key={tok.i} className={`md-h${tok.level}`}>{inline(tok.content)}</div>
         }
         if (tok.type === 'ul') {
           return (
             <ul key={tok.i} className="md-ul">
-              {tok.items.map((item, j) => <li key={j}>{renderInline(item)}</li>)}
+              {tok.items.map((item, j) => <li key={j}>{inline(item)}</li>)}
             </ul>
           )
         }
         if (tok.type === 'ol') {
           return (
             <ol key={tok.i} className="md-ol">
-              {tok.items.map((item, j) => <li key={j}>{renderInline(item)}</li>)}
+              {tok.items.map((item, j) => <li key={j}>{inline(item)}</li>)}
             </ol>
           )
         }
-        return <p key={tok.i} className="md-p">{renderInline(tok.content)}</p>
+        if (tok.type === 'table') {
+          return (
+            <div key={tok.i} className="md-table-wrap">
+              <table className="md-table">
+                <thead>
+                  <tr>
+                    {tok.table.headers.map((header, j) => <th key={j}>{inline(header)}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {tok.table.rows.map((row, i) => (
+                    <tr key={i}>
+                      {row.map((cell, j) => <td key={j}>{inline(cell)}</td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        }
+        return <p key={tok.i} className="md-p">{inline(tok.content)}</p>
       })}
     </>
   )

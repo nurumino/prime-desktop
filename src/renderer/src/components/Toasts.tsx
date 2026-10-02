@@ -6,9 +6,9 @@ interface Toast {
 
 export default function Toasts({ toasts }: { toasts: Toast[] }): JSX.Element {
   return (
-    <div className="toasts">
+    <div className="toasts" role="status" aria-live="polite">
       {toasts.map((t) => (
-        <div key={t.id} className={`toast ${t.kind}`}>
+        <div key={t.id} className={`toast ${t.kind}`} role={t.kind === 'error' ? 'alert' : undefined}>
           {t.text}
         </div>
       ))}

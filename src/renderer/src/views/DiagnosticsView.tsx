@@ -38,8 +38,19 @@ export default function DiagnosticsView({ activeAgentId }: { activeAgentId: stri
   return (
     <div className="view diagnostics-page">
       <header className="view-header">
-        <h2>Daemon & traces</h2>
-        <p className="view-sub">Direct controls for Prime Agent’s resident daemon and local trace sessions.</p>
+        <div className="view-heading">
+          <span className="view-chip chip-daemon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="4" width="18" height="7" rx="2" />
+              <rect x="3" y="13" width="18" height="7" rx="2" />
+              <path d="M7 7.5h.01M7 16.5h.01M11 7.5h.01M11 16.5h.01" />
+            </svg>
+          </span>
+          <div>
+            <h2>Daemon & traces</h2>
+            <p className="view-sub">Direct controls for Prime Agent’s resident daemon and local trace sessions.</p>
+          </div>
+        </div>
       </header>
 
       <section className="panel">

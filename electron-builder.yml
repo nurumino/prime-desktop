@@ -25,5 +25,6 @@ dmg:
       type: link
       path: /Applications
 npmRebuild: false
+afterPack: scripts/after-pack.mjs
 electronDownload:
   mirror: https://npmmirror.com/mirrors/electron/

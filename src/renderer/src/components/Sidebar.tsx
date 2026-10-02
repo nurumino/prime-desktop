@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react'
-import type { AppState } from '../lib/store'
+import { useState, useEffect, useRef } from 'react'
+import { extractText, type AppState } from '../lib/store'
 import type { ViewId, SessionSummary } from '@shared/types'
 import CloudMark from './CloudMark'
 import WorkingMark from './WorkingMark'
@@ -14,9 +14,17 @@ interface Props {
   onOpenFolder?: () => void
   collapsed?: boolean
   onToggle?: () => void
+  canGoBack?: boolean
+  canGoForward?: boolean
+  onBack?: () => void
+  onForward?: () => void
+  hoverOpen?: boolean
+  onHoverLeave?: () => void
+  /** Show a chat that is already live in one of the project's parallel slots. */
+  onFocusChat?: (tabId: string, agentId: string) => void
 }
 
-export default function Sidebar({ state, activeAgentId, onView, onNewChat, onSelectTab, onCloseTab, onOpenFolder, collapsed = false, onToggle }: Props): JSX.Element {
+export default function Sidebar({ state, activeAgentId, onView, onNewChat, onSelectTab, onCloseTab, onOpenFolder, collapsed = false, onToggle, canGoBack = false, canGoForward = false, onBack, onForward, hoverOpen = false, onHoverLeave, onFocusChat }: Props): JSX.Element {
   const [sessionsByAgent, setSessionsByAgent] = useState<Record<string, SessionSummary[]>>({})
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const [expandedTabs, setExpandedTabs] = useState<Set<string>>(new Set())
@@ -26,41 +34,66 @@ export default function Sidebar({ state, activeAgentId, onView, onNewChat, onSel
   const [pinnedSessions, setPinnedSessions] = useState<Set<string>>(new Set())
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [deletingSession, setDeletingSession] = useState<string | null>(null)
+  const agentsRef = useRef(state.agents)
+  agentsRef.current = state.agents
 
   const agent = activeAgentId ? state.agents[activeAgentId] : null
   const working = agent && (agent.status === 'working' || agent.isStreaming)
+  // Changes whenever a parallel chat opens, closes or switches session, so the
+  // chat list picks up rows that only exist in memory so far.
+  const liveChatsKey = Object.values(state.agents).map((item) => `${item.id}:${item.sessionId ?? ''}`).sort().join('|')
+
+  const chatsInTab = (tabId: string) => tabChats(state.agents, tabId)
+  const liveChat = (tabId: string, sessionId: string) => chatsInTab(tabId).find((item) => item.sessionId === sessionId)
+  const chatAgentForTab = (tabId: string) => (
+    tabId === state.activeTabId && activeAgentId ? activeAgentId : `agent-${tabId}`
+  )
 
   useEffect(() => {
     let disposed = false
-    const load = (agentId: string) => void window.prime.agentSessions(agentId)
-      .then((items) => {
-        if (disposed) return
-        setSessionsByAgent((previous) => ({ ...previous, [agentId]: items }))
-        setSessionError(null)
-      })
-      .catch(() => {
-        if (!disposed) setSessionError('Chats could not be loaded')
-      })
+    const requests: Record<string, number> = {}
+    const load = (agentId: string) => {
+      const request = requests[agentId] = (requests[agentId] ?? 0) + 1
+      const current = agentsRef.current[agentId]
+      void window.prime.agentSessions(agentId)
+        .then(async (items: SessionSummary[]) => {
+          // The daemon can hold a new chat in memory until its first reply,
+          // and every parallel chat in the project may have one.
+          for (const chat of tabChats(agentsRef.current, agentId.replace(/^agent-/, ''))) {
+            if (!chat.sessionId || items.some((item) => item.sessionId === chat.sessionId)) continue
+            const messages = await window.prime.agentMessages(chat.id).catch(() => [])
+            items = sessionsWithLiveChat(items, chat, messages)
+          }
+          if (disposed || requests[agentId] !== request || current?.sessionId !== agentsRef.current[agentId]?.sessionId) return
+          setSessionsByAgent((previous) => ({ ...previous, [agentId]: items }))
+          setSessionError(null)
+        })
+        .catch(() => {
+          if (!disposed && requests[agentId] === request) setSessionError('Chats could not be loaded')
+        })
+    }
     const loadAll = () => {
       for (const tab of state.tabs) load(`agent-${tab.id}`)
     }
     loadAll()
     const timer = window.setInterval(loadAll, 15000)
     const off = window.prime.onEvent((raw) => {
-      const event = raw as { agentId?: string; type?: string }
+      const event = raw as { agentId?: string; type?: string; payload?: { message?: { role?: string } } }
       if (event.agentId && (
         event.type === 'turn_end'
         || event.type === 'session_resumed'
         || event.type === 'session_started'
         || event.type === 'session_replaced'
-      )) load(event.agentId)
+        || event.type === 'agent_end'
+        || ((event.type === 'message_start' || event.type === 'message_end') && event.payload?.message?.role === 'user')
+      )) load(projectAgentId(event.agentId))
     })
     return () => {
       disposed = true
       window.clearInterval(timer)
       off()
     }
-  }, [state.tabs])
+  }, [state.tabs, agent?.sessionId, liveChatsKey])
 
   useEffect(() => {
     void window.prime.sessionPinsGet().then((paths: string[]) => setPinnedSessions(new Set(paths)))
@@ -71,7 +104,7 @@ export default function Sidebar({ state, activeAgentId, onView, onNewChat, onSel
     if (state.activeTabId) {
       setExpandedTabs((prev) => new Set([...prev, state.activeTabId!]))
     }
-  }, [state.activeTabId])
+  }, [state.activeTabId, agent?.sessionId])
 
   function toggleTab(tabId: string) {
     setExpandedTabs((prev) => {
@@ -85,6 +118,14 @@ export default function Sidebar({ state, activeAgentId, onView, onNewChat, onSel
   function openSession(tabId: string, agentId: string, session: SessionSummary) {
     onSelectTab?.(tabId)
     onView('chat')
+    // A chat that is live in a slot is shown as is. Unsaved rows only exist
+    // in a slot, so they have no file to resume.
+    const live = liveChat(tabId, session.sessionId)
+    if (live) {
+      onFocusChat?.(tabId, live.id)
+      return
+    }
+    if (!session.sessionFile) return
     setSelectedSession(session.sessionFile)
     setSessionLoading(session.sessionFile)
     setSessionError(null)
@@ -127,10 +168,6 @@ export default function Sidebar({ state, activeAgentId, onView, onNewChat, onSel
       .finally(() => setDeletingSession(null))
   }
 
-  if (collapsed) {
-    return <aside className="sidebar collapsed" aria-hidden="true" />
-  }
-
   const pinnedRows = state.tabs.flatMap((tab) => {
     const agentId = `agent-${tab.id}`
     return (sessionsByAgent[agentId] ?? [])
@@ -139,16 +176,20 @@ export default function Sidebar({ state, activeAgentId, onView, onNewChat, onSel
   })
 
   return (
-    <aside className="sidebar">
+    <aside
+      className={`sidebar ${collapsed ? 'collapsed-overlay' : ''} ${hoverOpen ? 'hover-open' : ''}`}
+      aria-hidden={collapsed && !hoverOpen}
+      onMouseLeave={collapsed && hoverOpen ? onHoverLeave : undefined}
+    >
       <div className="sidebar-drag" />
       <div className="sidebar-window-controls">
         <button className="sidebar-titlebar-btn" title="Collapse sidebar" onClick={onToggle}>
           <CollapseIcon collapsed={false} />
         </button>
-        <button className="sidebar-titlebar-btn" title="Back" disabled>
+        <button className="sidebar-titlebar-btn" title="Back" aria-label="Back" disabled={!canGoBack} onClick={onBack}>
           <BackIcon />
         </button>
-        <button className="sidebar-titlebar-btn" title="Forward" disabled>
+        <button className="sidebar-titlebar-btn" title="Forward" aria-label="Forward" disabled={!canGoForward} onClick={onForward}>
           <ForwardIcon />
         </button>
       </div>
@@ -242,10 +283,9 @@ export default function Sidebar({ state, activeAgentId, onView, onNewChat, onSel
             <div className="sidebar-pinned-group">
               <div className="section-title">Pinned</div>
               {pinnedRows.map(({ tab, agentId: pinnedAgentId, session }) => {
-                const tabAgent = state.agents[pinnedAgentId]
                 const isCurrentSession = tab.id === state.activeTabId && (
-                  session.sessionId === tabAgent?.sessionId
-                  || (!tabAgent?.sessionId && selectedSession === session.sessionFile)
+                  session.sessionId === agent?.sessionId
+                  || (!agent?.sessionId && selectedSession === session.sessionFile)
                 )
                 return (
                   <SessionRow
@@ -254,10 +294,10 @@ export default function Sidebar({ state, activeAgentId, onView, onNewChat, onSel
                     active={isCurrentSession}
                     pinned
                     loading={sessionLoading === session.sessionFile}
-                    working={isCurrentSession && isAgentWorking(tabAgent)}
+                    working={isAgentWorking(liveChat(tab.id, session.sessionId))}
                     confirmingDelete={confirmDelete === session.sessionFile}
                     deleting={deletingSession === session.sessionFile}
-                    onOpen={() => openSession(tab.id, pinnedAgentId, session)}
+                    onOpen={() => openSession(tab.id, chatAgentForTab(tab.id), session)}
                     onPin={() => setPinned(session.sessionFile, false)}
                     onRequestDelete={() => setConfirmDelete(session.sessionFile)}
                     onCancelDelete={() => setConfirmDelete(null)}
@@ -271,7 +311,6 @@ export default function Sidebar({ state, activeAgentId, onView, onNewChat, onSel
             const isActive = tab.id === state.activeTabId
             const isExpanded = expandedTabs.has(tab.id)
             const tabAgentId = `agent-${tab.id}`
-            const tabAgent = state.agents[tabAgentId]
             const sessions = sessionsByAgent[tabAgentId] ?? []
             const unpinnedSessions = sessions.filter((session) => !pinnedSessions.has(session.sessionFile))
 
@@ -315,20 +354,20 @@ export default function Sidebar({ state, activeAgentId, onView, onNewChat, onSel
                     ) : (
                       unpinnedSessions.map((s) => {
                         const isCurrentSession = isActive && (
-                          s.sessionId === tabAgent?.sessionId
-                          || (!tabAgent?.sessionId && selectedSession === s.sessionFile)
+                          s.sessionId === agent?.sessionId
+                          || (!agent?.sessionId && selectedSession === s.sessionFile)
                         )
                         return (
                           <SessionRow
-                            key={s.sessionFile}
+                            key={s.sessionId}
                             session={s}
                             active={isCurrentSession}
                             pinned={false}
                             loading={sessionLoading === s.sessionFile}
-                            working={isCurrentSession && isAgentWorking(tabAgent)}
+                            working={isAgentWorking(liveChat(tab.id, s.sessionId))}
                             confirmingDelete={confirmDelete === s.sessionFile}
                             deleting={deletingSession === s.sessionFile}
-                            onOpen={() => openSession(tab.id, tabAgentId, s)}
+                            onOpen={() => openSession(tab.id, chatAgentForTab(tab.id), s)}
                             onPin={() => setPinned(s.sessionFile, true)}
                             onRequestDelete={() => setConfirmDelete(s.sessionFile)}
                             onCancelDelete={() => setConfirmDelete(null)}
@@ -400,7 +439,7 @@ function SessionRow({
         {(working || loading) && <WorkingMark label={loading ? 'Opening' : 'Working'} />}
         <span className="session-item-title">{title}</span>
       </button>
-      <div className={`session-row-actions ${confirmingDelete ? 'confirming' : ''}`}>
+      {session.sessionFile && <div className={`session-row-actions ${confirmingDelete ? 'confirming' : ''}`}>
         {confirmingDelete ? (
           <>
             <button className="session-action confirm" type="button" onClick={onConfirmDelete} disabled={deleting} title="Confirm delete" aria-label={`Delete ${title}`}>
@@ -420,9 +459,37 @@ function SessionRow({
             </button>
           </>
         )}
-      </div>
+      </div>}
     </div>
   )
+}
+
+export function sessionsWithLiveChat(
+  sessions: SessionSummary[],
+  agent: AppState['agents'][string],
+  messages: unknown[]
+): SessionSummary[] {
+  if (!agent.sessionId || sessions.some((session) => session.sessionId === agent.sessionId)) return sessions
+  const users = (messages as { role?: string; content?: unknown; timestamp?: number }[]).filter((message) => message?.role === 'user')
+  if (users.length === 0) return sessions
+  const text = extractText(users[0].content).replace(/\s+/g, ' ').trim()
+  return [{
+    sessionId: agent.sessionId,
+    sessionFile: '',
+    name: agent.sessionName || (text.length > 58 ? `${text.slice(0, 57).trimEnd()}…` : text) || 'New chat',
+    messageCount: users.length,
+    workingDirectory: agent.path,
+    mtime: users[users.length - 1].timestamp ?? Date.now()
+  }, ...sessions]
+}
+
+export function tabChats(agents: AppState['agents'], tabId: string): AppState['agents'][string][] {
+  return Object.values(agents).filter((chat) => (chat.tabId ?? projectAgentId(chat.id).replace(/^agent-/, '')) === tabId)
+}
+
+function projectAgentId(agentId: string): string {
+  // Parallel chat slots are named `agent-<tab>--<slot>`.
+  return agentId.replace(/--[^-]+$/, '')
 }
 
 function isAgentWorking(agent?: AppState['agents'][string]): boolean {

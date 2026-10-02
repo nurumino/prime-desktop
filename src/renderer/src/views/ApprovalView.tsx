@@ -1,17 +1,17 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { Checkpoint, FileDiff, PermissionRule } from '@shared/types'
+import type { Checkpoint, FileDiff } from '@shared/types'
+import ConfirmButton from '../components/ConfirmButton'
 
 interface Props {
   activeAgentId: string | null
-  projectPath: string | null
 }
 
-export default function ApprovalView({ activeAgentId, projectPath }: Props): JSX.Element {
+export default function ApprovalView({ activeAgentId }: Props): JSX.Element {
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([])
   const [diffs, setDiffs] = useState<FileDiff[]>([])
-  const [perms, setPerms] = useState<PermissionRule[]>([])
   const [selected, setSelected] = useState<FileDiff | null>(null)
   const [restoring, setRestoring] = useState<string | null>(null)
+  const [restoreError, setRestoreError] = useState('')
 
   const load = useCallback(() => {
     if (!activeAgentId) return
@@ -20,7 +20,6 @@ export default function ApprovalView({ activeAgentId, projectPath }: Props): JSX
       setDiffs(d)
       setSelected((s) => s ?? d[0] ?? null)
     })
-    void window.prime.permissionsList().then(setPerms)
   }, [activeAgentId])
 
   useEffect(() => {
@@ -46,17 +45,30 @@ export default function ApprovalView({ activeAgentId, projectPath }: Props): JSX
   return (
     <div className="view review-page">
       <header className="view-header">
-        <h2>Review</h2>
-        <p className="view-sub">
-          Each prompt creates a git checkpoint so you can inspect the diff and restore with one click.
-        </p>
+        <div className="view-heading">
+          <span className="view-chip chip-review" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="6" cy="6" r="2.4" />
+              <circle cx="6" cy="18" r="2.4" />
+              <circle cx="18" cy="7" r="2.4" />
+              <path d="M6 8.5v7M15.8 8.2C14 11 10 10.5 8.3 16" />
+            </svg>
+          </span>
+          <div>
+            <h2>Review</h2>
+            <p className="view-sub">
+              Before each prompt, the project is snapshotted to a private git ref. Your branch history and staging area are never touched.
+            </p>
+          </div>
+        </div>
       </header>
 
       <div className="approval-layout">
         <div className="approval-col">
           <section className="panel">
             <div className="panel-head">Checkpoints</div>
-            {checkpoints.length === 0 && <div className="cmd-empty">No checkpoints yet — send a prompt and a git checkpoint is created first.</div>}
+            {restoreError && <div className="sp-chat-error">{restoreError}</div>}
+            {checkpoints.length === 0 && <div className="cmd-empty">No checkpoints yet. One is saved before each prompt in a git project.</div>}
             {checkpoints.map((c) => (
               <div key={c.id} className="checkpoint-row">
                 <div className="checkpoint-main">
@@ -64,19 +76,27 @@ export default function ApprovalView({ activeAgentId, projectPath }: Props): JSX
                   <span className="checkpoint-label">{c.label}</span>
                   <span className="checkpoint-time">{new Date(c.createdAt).toLocaleString()}</span>
                 </div>
-                <div className="checkpoint-files">{c.dirtyFiles.length} dirty files</div>
-                <button
+                <div className="checkpoint-files">{c.dirtyFiles.length} changed {c.dirtyFiles.length === 1 ? 'file' : 'files'}</div>
+                <ConfirmButton
                   className="btn danger small"
                   disabled={restoring !== null}
-                  onClick={async () => {
+                  confirmLabel="Overwrite files?"
+                  title="Restore the project files to this checkpoint"
+                  onConfirm={async () => {
                     setRestoring(c.id)
-                    await window.prime.gitRestore(activeAgentId, c.id)
-                    setRestoring(null)
-                    load()
+                    setRestoreError('')
+                    try {
+                      await window.prime.gitRestore(activeAgentId, c.id)
+                    } catch (error) {
+                      setRestoreError(error instanceof Error ? error.message : String(error))
+                    } finally {
+                      setRestoring(null)
+                      load()
+                    }
                   }}
                 >
                   {restoring === c.id ? 'Restoring…' : 'Restore'}
-                </button>
+                </ConfirmButton>
               </div>
             ))}
           </section>
@@ -115,51 +135,6 @@ export default function ApprovalView({ activeAgentId, projectPath }: Props): JSX
         </div>
       </div>
 
-      <section className="panel">
-        <div className="panel-head">Permission rules</div>
-        <div className="row-gap">
-          <input id="perm-pattern" className="field" placeholder="command pattern, e.g. rm -rf or *" />
-          <select id="perm-action" className="field">
-            <option value="deny">deny</option>
-            <option value="allow">allow</option>
-          </select>
-          <select id="perm-scope" className="field">
-            <option value="global">global</option>
-            <option value="project">this project</option>
-          </select>
-          <button
-            className="btn primary small"
-            onClick={() => {
-              const pattern = (document.getElementById('perm-pattern') as HTMLInputElement).value.trim()
-              if (!pattern) return
-              const action = (document.getElementById('perm-action') as HTMLSelectElement).value as 'allow' | 'deny'
-              const scope = (document.getElementById('perm-scope') as HTMLSelectElement).value as 'global' | 'project'
-              void window.prime.permissionsSet(pattern, action, scope, scope === 'project' ? projectPath ?? undefined : undefined).then(() =>
-                void window.prime.permissionsList().then(setPerms)
-              )
-              ;(document.getElementById('perm-pattern') as HTMLInputElement).value = ''
-            }}
-          >
-            Add rule
-          </button>
-        </div>
-        {perms.length === 0 && <div className="cmd-empty">No rules — all commands are asked before running (via extension dialogs).</div>}
-        {perms.map((p, i) => (
-          <div key={i} className="perm-row">
-            <code>{p.pattern}</code>
-            <span className={`perm-action ${p.action}`}>{p.action}</span>
-            <span className="perm-scope">{p.scope}{p.scope === 'project' ? ' · ' + (p.projectPath ?? '') : ''}</span>
-            <button
-              className="btn ghost small"
-              onClick={() => {
-                void window.prime.permissionsRemove(i).then(() => void window.prime.permissionsList().then(setPerms))
-              }}
-            >
-              remove
-            </button>
-          </div>
-        ))}
-      </section>
     </div>
   )
 }

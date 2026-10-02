@@ -1,9 +1,10 @@
 import { EventEmitter } from 'events'
 import { spawn } from 'child_process'
-import { realpathSync } from 'fs'
+import { existsSync, realpathSync, unlinkSync } from 'fs'
+import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import { pathToFileURL } from 'url'
-import type { AppSettings, SubagentNode } from '@shared/types'
+import type { AppSettings, ExternalAgentInfo, SubagentNode } from '@shared/types'
 
 export interface DaemonConnection {
   subscribe(listener: (event: Record<string, unknown>) => void): () => void
@@ -36,6 +37,7 @@ export interface DaemonConnection {
   steer(message: string, images?: unknown[]): Promise<void>
   followUp(message: string, images?: unknown[]): Promise<void>
   abort(): Promise<void>
+  abortAndSendQueued?(): Promise<void>
   cancelRlmChild(childId: string): Promise<boolean>
   executeBash(command: string, options?: Record<string, unknown>): Promise<void>
   setModel(provider: string, modelId: string): Promise<unknown>
@@ -88,9 +90,12 @@ export interface DaemonTreeNode {
 }
 
 interface DaemonClientLike {
+  readonly hello?: { supervisorPid?: number }
   connect(timeoutMs?: number): Promise<void>
+  waitForHello(timeoutMs?: number): Promise<{ supervisorPid?: number }>
   request(command: Record<string, unknown>, timeoutMs?: number): Promise<Record<string, unknown>>
   close(): void
+  supportsServerCapability?(capability: string): boolean
 }
 
 interface DaemonModules {
@@ -113,7 +118,7 @@ interface Options {
 
 let modulesPromise: Promise<DaemonModules> | null = null
 
-function packageRoot(binary: string): string {
+export function packageRoot(binary: string): string {
   const resolved = realpathSync(binary)
   const marker = join('dist', 'bundle', 'cli.js')
   if (resolved.endsWith(marker)) return dirname(dirname(dirname(resolved)))
@@ -137,6 +142,65 @@ async function loadModules(binary: string): Promise<DaemonModules> {
   return modulesPromise
 }
 
+// Terminal-launched `prime-agent` sessions live on the CLI's own daemon socket,
+// separate from the desktop's. Discovery reads that daemon read-only.
+export function defaultCliDaemonSocket(): string {
+  if (process.platform === 'win32') return '\\\\.\\pipe\\prime-agent-daemon'
+  const suffix = typeof process.getuid === 'function' ? String(process.getuid()) : 'user'
+  return join(tmpdir(), `prime-agent-${suffix}`, 'daemon.sock')
+}
+
+export async function listExternalSessions(binary: string): Promise<ExternalAgentInfo[]> {
+  const socketPath = defaultCliDaemonSocket()
+  if (!existsSync(socketPath)) return []
+  let client: DaemonClientLike
+  try {
+    const { DaemonClient } = await loadModules(binary)
+    client = new DaemonClient(socketPath)
+    await client.connect(1_200)
+  } catch {
+    return []
+  }
+  try {
+    const response = await client.request({ type: 'list', includeClientOwned: true }, 8_000)
+    if (response.success !== true) return []
+    const sessions = (((response.data as Record<string, unknown> | undefined)?.sessions ?? []) as Record<string, unknown>[])
+      .filter((session) => String(session.runtimeKind ?? 'root') !== 'subagent')
+      .filter((session) => String(session.lifecycle ?? '') !== 'archived')
+    const out: ExternalAgentInfo[] = []
+    for (const session of sessions) {
+      const sessionId = String(session.sessionId ?? session.id ?? '')
+      const activeSessionId = session.activeSessionId ? String(session.activeSessionId) : sessionId
+      if (!sessionId || !activeSessionId) continue
+      const rawStatus = String(session.status ?? session.activity ?? '').toLowerCase()
+      const status: ExternalAgentInfo['status'] =
+        rawStatus === 'error' || rawStatus === 'failed'
+          ? 'error'
+          : ['working', 'queued', 'starting'].includes(rawStatus) || session.isStreaming === true
+            ? 'working'
+            : 'idle'
+      const timestamp = Date.parse(String(session.lastActivityAt ?? session.modified ?? session.created ?? ''))
+      const firstMessage = String(session.firstMessage ?? '')
+      out.push({
+        activeSessionId,
+        sessionId,
+        name: String(session.sessionName ?? '') || (firstMessage === '(no messages)' ? '' : firstMessage.slice(0, 60)) || sessionId.slice(0, 8),
+        task: firstMessage === '(no messages)' ? '' : firstMessage.slice(0, 200),
+        cwd: String(session.cwd ?? session.workingDirectory ?? ''),
+        status,
+        isStreaming: session.isStreaming === true || status === 'working',
+        lastActivityAt: Number.isFinite(timestamp) ? timestamp : 0
+      })
+    }
+    out.sort((a, b) => b.lastActivityAt - a.lastActivityAt)
+    return out
+  } catch {
+    return []
+  } finally {
+    client.close()
+  }
+}
+
 function childEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env }
   delete env.ELECTRON_RUN_AS_NODE
@@ -144,16 +208,34 @@ function childEnv(): NodeJS.ProcessEnv {
   return env
 }
 
+function errorCode(error: unknown): string {
+  return (error && typeof error === 'object' && 'code' in error) ? String((error as { code?: unknown }).code) : ''
+}
+
 async function connectWithStartup(
   Client: DaemonModules['DaemonClient'],
   binary: string,
-  socketPath: string
+  socketPath: string,
+  skipExisting = false
 ): Promise<DaemonClientLike> {
   const first = new Client(socketPath)
-  try {
-    await first.connect(1_500)
-    return first
-  } catch {
+  if (!skipExisting) {
+    try {
+      await first.connect(1_500)
+      return first
+    } catch (error) {
+      first.close()
+      // A socket file with no listener means a daemon died without cleanup.
+      // Remove the stale file or the fresh supervisor cannot bind it.
+      if (errorCode(error) === 'ECONNREFUSED' && existsSync(socketPath)) {
+        try {
+          unlinkSync(socketPath)
+        } catch {
+          /* another process may have already removed it */
+        }
+      }
+    }
+  } else {
     first.close()
   }
 
@@ -178,6 +260,70 @@ async function connectWithStartup(
   throw lastError instanceof Error ? lastError : new Error('Prime Agent daemon did not start.')
 }
 
+async function daemonPid(
+  Client: DaemonModules['DaemonClient'],
+  socketPath: string
+): Promise<{ reachable: boolean; pid: number | null }> {
+  const probe = new Client(socketPath)
+  let reachable = false
+  try {
+    await probe.connect(500)
+    reachable = true
+    const hello = await probe.waitForHello(500)
+    const pid = Number(hello.supervisorPid)
+    return { reachable, pid: Number.isInteger(pid) && pid > 0 ? pid : null }
+  } catch {
+    return { reachable, pid: null }
+  } finally {
+    probe.close()
+  }
+}
+
+async function waitForDaemonExit(
+  Client: DaemonModules['DaemonClient'],
+  socketPath: string,
+  timeoutMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const probe = await daemonPid(Client, socketPath)
+    if (!probe.reachable) {
+      if (existsSync(socketPath)) {
+        try {
+          unlinkSync(socketPath)
+        } catch {
+          /* the daemon may have removed it */
+        }
+      }
+      return true
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  return false
+}
+
+async function stopStaleDaemon(
+  Client: DaemonModules['DaemonClient'],
+  client: DaemonClientLike,
+  socketPath: string
+): Promise<void> {
+  const stalePid = Number(client.hello?.supervisorPid)
+  await client.request({ type: 'shutdown', force: true }, 5_000).catch(() => {})
+  client.close()
+  if (await waitForDaemonExit(Client, socketPath, 3_000)) return
+
+  const current = await daemonPid(Client, socketPath)
+  if (!Number.isInteger(stalePid) || stalePid <= 0 || current.pid !== stalePid) {
+    throw new Error(`Could not safely stop the stale Prime Agent daemon at ${socketPath}`)
+  }
+  process.kill(stalePid, 'SIGTERM')
+  if (await waitForDaemonExit(Client, socketPath, 2_000)) return
+  process.kill(stalePid, 'SIGKILL')
+  if (!await waitForDaemonExit(Client, socketPath, 2_000)) {
+    throw new Error(`Timed out stopping the stale Prime Agent daemon at ${socketPath}`)
+  }
+}
+
 function responseData(response: Record<string, unknown>, command: string): Record<string, unknown> {
   if (response.success !== true) throw new Error(String(response.error ?? `${command} failed`))
   return (response.data as Record<string, unknown> | undefined) ?? {}
@@ -191,6 +337,7 @@ export class DaemonTransport extends EventEmitter {
   private exitHandlers = new Set<() => void>()
   private started = false
   private disposed = false
+  private rootActiveSessionId: string | null = null
 
   constructor(private readonly options: Options) {
     super()
@@ -200,6 +347,10 @@ export class DaemonTransport extends EventEmitter {
     return this.started && !this.disposed && this.connection !== null
   }
 
+  supports(capability: string): boolean {
+    return this.client?.supportsServerCapability?.(capability) === true
+  }
+
   onExit(fn: () => void): void {
     this.exitHandlers.add(fn)
   }
@@ -207,7 +358,7 @@ export class DaemonTransport extends EventEmitter {
   async start(): Promise<void> {
     if (this.started) return
     const { DaemonClient, DaemonAgentConnection } = await loadModules(this.options.binary)
-    const client = await connectWithStartup(DaemonClient, this.options.binary, this.options.socketPath)
+    let client = await connectWithStartup(DaemonClient, this.options.binary, this.options.socketPath)
     this.client = client
     try {
       const model = this.options.settings.model
@@ -235,12 +386,30 @@ export class DaemonTransport extends EventEmitter {
           config.model = model
         }
       }
-      const created = responseData(
-        await client.request({ type: 'create', lifecycle: 'resident', config }, 120_000),
-        'create'
-      )
+      let created: Record<string, unknown>
+      try {
+        created = responseData(
+          await client.request({ type: 'create', lifecycle: 'resident', config }, 120_000),
+          'create'
+        )
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        // A daemon can outlive the Node installation that launched it, or its
+        // supervisor can lose ownership of the on-disk registry (update, crash
+        // of a prior generation). Both mean this supervisor is unrecoverable:
+        // ask it to exit, then start a fresh one with the current runtime.
+        if (!/worker pid|spawn .*node|ENOENT|registry entry|generation/i.test(message)) throw error
+        await stopStaleDaemon(DaemonClient, client, this.options.socketPath)
+        client = await connectWithStartup(DaemonClient, this.options.binary, this.options.socketPath, true)
+        this.client = client
+        created = responseData(
+          await client.request({ type: 'create', lifecycle: 'resident', config }, 120_000),
+          'create'
+        )
+      }
       const activeSessionId = String(created.activeSessionId ?? '')
       if (!activeSessionId) throw new Error('Prime Agent daemon did not return an active session.')
+      this.rootActiveSessionId = activeSessionId
       const connection = await DaemonAgentConnection.attach(client, activeSessionId, {
         closeClientOnDispose: true,
         supportsExtensionUi: true,
@@ -265,6 +434,21 @@ export class DaemonTransport extends EventEmitter {
         }
         this.emit('event', event)
       })
+
+      // A resident daemon can outlive the desktop window and keep the model
+      // from the previous client. Apply the desktop preference after attach,
+      // before the renderer can send the first prompt.
+      const configuredModel = this.options.settings.model
+      if (configuredModel) {
+        const slash = configuredModel.indexOf('/')
+        let provider = slash > 0 ? configuredModel.slice(0, slash) : ''
+        const modelId = slash > 0 ? configuredModel.slice(slash + 1) : configuredModel
+        if (!provider && modelId) {
+          const models = await connection.getAvailableModels() as Record<string, unknown>[]
+          provider = String(models.find((model) => model.id === modelId)?.provider ?? '')
+        }
+        if (provider && modelId) await connection.setModel(provider, modelId)
+      }
       this.started = true
       await connection.setRlmMaxDepth(this.options.settings.rlmMaxDepth, { global: false })
       await connection.setTransport(this.options.settings.transport).catch(() => {})
@@ -403,7 +587,8 @@ export class DaemonTransport extends EventEmitter {
       case 'prompt':
         result = await c.prompt(String(cmd.message ?? ''), {
           images: cmd.images,
-          streamingBehavior: cmd.streamingBehavior
+          // The daemon uses this option to resume input after Stop.
+          streamingBehavior: cmd.streamingBehavior ?? 'followUp'
         })
         break
       case 'steer':
@@ -530,12 +715,24 @@ export class DaemonTransport extends EventEmitter {
     void this.send(cmd).catch((error) => this.emit('process_error', error instanceof Error ? error.message : String(error)))
   }
 
-  stop(): void {
-    void this.dispose()
+  stop(): Promise<void> {
+    return this.dispose()
   }
 
   kill(): void {
     void this.dispose()
+  }
+
+  // Disconnecting leaves a resident worker running in the daemon. A chat slot
+  // the desktop opened and no longer needs is stopped outright so idle
+  // workers don't pile up.
+  async release(): Promise<void> {
+    const client = this.client
+    const activeSessionId = this.rootActiveSessionId
+    if (client && activeSessionId && !this.disposed) {
+      await client.request({ type: 'kill', activeSessionId }, 10_000).catch(() => {})
+    }
+    await this.dispose()
   }
 
   private async dispose(): Promise<void> {

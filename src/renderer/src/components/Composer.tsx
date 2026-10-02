@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import AccessPicker, { type AccessMode } from './AccessPicker'
 import DepthSlider from './DepthSlider'
 import type { ModelOption } from '@shared/models'
 import type { ProjectTab } from '@shared/types'
+import { THINKING_LEVELS, thinkingLabel } from '@shared/thinking'
 import { BUILTIN_SLASH_COMMANDS, getSlashCommand, isBuiltinSlash, parseSlash, slashOpensOnPick } from '@shared/slash'
 
 function mergeCommands(
@@ -28,13 +28,14 @@ interface Props {
   onSlash: (text: string) => void
   onAbort: () => void
   onBash: (cmd: string) => void
+  onFollowUp?: (text: string) => void
   models?: ModelOption[]
   currentModel?: string
   onSelectModel?: (model: string) => void
+  onRefreshModels?: () => void
+  onToast?: (text: string, kind?: 'info' | 'success' | 'warning' | 'error') => void
   effortLevel?: string
   onSelectEffort?: (effort: string) => void
-  accessMode?: AccessMode
-  onAccessModeChange?: (mode: AccessMode) => void
   rlmMaxDepth?: number
   onDepthChange?: (depth: number) => void
   openPicker?: 'models' | 'effort' | 'depth' | null
@@ -49,9 +50,21 @@ interface Props {
   showContext?: boolean
   externalText?: string
   banner?: ReactNode
+  header?: ReactNode
 }
 
-const EFFORT_LEVELS = ['Light', 'Medium', 'High', 'Extra High', 'Max']
+function modelProvider(model: ModelOption): string {
+  return model.provider || (model.key.includes('/') ? model.key.split('/')[0] : '')
+}
+
+function groupByProvider(models: ModelOption[]): [string, ModelOption[]][] {
+  const groups = new Map<string, ModelOption[]>()
+  for (const model of models) {
+    const provider = modelProvider(model)
+    groups.set(provider, [...(groups.get(provider) ?? []), model])
+  }
+  return [...groups.entries()]
+}
 
 /** Extract a short display name from a full model path */
 function shortModelName(raw: string): string {
@@ -79,13 +92,14 @@ export default function Composer({
   onSlash,
   onAbort,
   onBash,
+  onFollowUp,
   models = [],
   currentModel,
   onSelectModel,
-  effortLevel = 'Light',
+  onRefreshModels,
+  onToast,
+  effortLevel = 'medium',
   onSelectEffort,
-  accessMode = 'ask',
-  onAccessModeChange,
   rlmMaxDepth = 1,
   onDepthChange,
   openPicker = null,
@@ -99,7 +113,8 @@ export default function Composer({
   onBranchClick,
   showContext = true,
   externalText,
-  banner
+  banner,
+  header
 }: Props): JSX.Element {
   const [text, setText] = useState('')
   const [images, setImages] = useState<{ type: 'image'; data: string; mimeType: string }[]>([])
@@ -112,6 +127,7 @@ export default function Composer({
   const [chosenModel, setChosenModel] = useState<string | null>(null)
   const [pickerView, setPickerView] = useState<'main' | 'models' | 'effort' | 'depth'>('main')
   const [modelQuery, setModelQuery] = useState('')
+  const [openRouterModelId, setOpenRouterModelId] = useState('')
 
   const taRef = useRef<HTMLTextAreaElement>(null)
   const pickerRef = useRef<HTMLDivElement>(null)
@@ -205,12 +221,19 @@ export default function Composer({
       insertCommand(filtered[cmdIndex]?.name ?? filtered[0].name)
       return
     }
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // Enter while an input method is composing (e.g. Japanese) confirms the
+    // candidate; it must not send half-composed text.
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
       e.preventDefault()
       if (showCmds && filtered.length > 0) {
         const picked = filtered[cmdIndex] ?? filtered[0]
         const rest = text.replace(/^\/\S*\s*/, '').trim()
         runSlash(`/${picked.name}${rest ? ` ${rest}` : ''}`)
+        return
+      }
+      if (e.altKey && busy && onFollowUp && text.trim() && images.length === 0 && !text.trim().startsWith('/') && !text.trim().startsWith('!')) {
+        onFollowUp(text.trim())
+        setText('')
         return
       }
       submit()
@@ -251,21 +274,50 @@ export default function Composer({
 
   const activeModelRaw = chosenModel ?? currentModel ?? ''
   const modelShort = shortModelName(activeModelRaw)
-  const pillLabel = `${modelShort} ${effortLevel}`
+  const effortLabel = thinkingLabel(effortLevel)
+  const pillLabel = `${modelShort} ${effortLabel}`
 
   const modelList = models.length > 0 ? models : activeModelRaw ? [{ key: activeModelRaw, provider: '', id: activeModelRaw, name: shortModelName(activeModelRaw) }] : []
+  // Every word must match the provider, name or id, so "sterling opus"
+  // narrows to one provider's Opus models.
+  const terms = modelQuery.trim().toLowerCase().split(/\s+/).filter(Boolean)
   const filteredModels = modelList.filter((model) => {
-    const q = modelQuery.trim().toLowerCase()
-    if (!q) return true
-    return `${model.name} ${model.key} ${model.id}`.toLowerCase().includes(q)
+    const haystack = `${modelProvider(model)} ${model.name} ${model.id}`.toLowerCase()
+    return terms.every((term) => haystack.includes(term))
   })
+  const modelGroups = groupByProvider(filteredModels)
   const filteredProjects = projects.filter((project) => {
     const query = projectQuery.trim().toLowerCase()
     return !query || `${project.name} ${project.path}`.toLowerCase().includes(query)
   })
 
+  // Resolve a typed model id against the real catalog before sending it.
+  // Blindly prefixing a provider produced "model not found" for ids that were
+  // renamed upstream or belong to another provider.
+  const useTypedModel = () => {
+    const raw = openRouterModelId.trim()
+    if (!raw) return
+    const lower = raw.toLowerCase()
+    const exactKey = modelList.find((m) => m.key.toLowerCase() === lower)
+    const exactId = modelList.filter((m) => m.id.toLowerCase() === lower)
+    const byName = modelList.filter((m) => (m.name ?? '').toLowerCase() === lower)
+    const match = exactKey ?? (exactId.length === 1 ? exactId[0] : null) ?? (byName.length === 1 ? byName[0] : null)
+    if (!match) {
+      onToast?.('Model ID is not in the current catalog. Refresh models first.', 'error')
+      return
+    }
+    const key = match.key
+    setChosenModel(key)
+    onSelectModel?.(key)
+    setOpenRouterModelId('')
+    setShowModelPicker(false)
+    setPickerView('main')
+    setModelQuery('')
+  }
+
   return (
     <div className="composer-wrap">
+      {header}
       {projectName && showContext && (
         <div className="composer-context">
           <div className="composer-project-control" ref={projectPickerRef}>
@@ -383,7 +435,7 @@ export default function Composer({
           className="composer-textarea"
           rows={1}
           value={text}
-          placeholder={busy ? 'Working… send to steer' : 'Do anything'}
+          placeholder={busy ? (onFollowUp ? 'Steer the agent  ·  ⌥↵ queues a follow-up' : 'Working… send to steer') : 'Do anything'}
           onChange={(e) => {
             const v = e.target.value
             setText(v)
@@ -430,9 +482,6 @@ export default function Composer({
             </svg>
           </button>
 
-          {/* Access mode badge */}
-          <AccessPicker mode={accessMode} onChange={onAccessModeChange ?? (() => {})} />
-
           {/* Spacer */}
           <div className="toolbar-spacer" />
 
@@ -469,7 +518,7 @@ export default function Composer({
                     >
                       <span className="popover-row-label">Effort</span>
                       <div className="popover-row-val">
-                        <span>{effortLevel}</span>
+                        <span>{effortLabel}</span>
                         <ChevronRightIcon />
                       </div>
                     </button>
@@ -480,13 +529,6 @@ export default function Composer({
                       <span className="popover-row-label">Depth</span>
                       <div className="popover-row-val">
                         <span>{rlmMaxDepth}</span>
-                        <ChevronRightIcon />
-                      </div>
-                    </button>
-                    <button className="popover-row" disabled>
-                      <span className="popover-row-label">Speed</span>
-                      <div className="popover-row-val">
-                        <span className="muted">Standard</span>
                         <ChevronRightIcon />
                       </div>
                     </button>
@@ -501,30 +543,61 @@ export default function Composer({
                     </button>
                     <div className="model-search-wrap">
                       <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" /></svg>
-                      <input autoFocus value={modelQuery} onChange={(e) => setModelQuery(e.target.value)} placeholder="Search models" aria-label="Search models" />
+                      <input autoFocus value={modelQuery} onChange={(e) => setModelQuery(e.target.value)} placeholder="Search models or providers" aria-label="Search models or providers" />
+                      <button className="btn ghost small" type="button" onClick={onRefreshModels} title="Refresh OpenRouter models">Refresh</button>
                     </div>
                     <div className="model-options-scroll">
+                      <div className="openrouter-model-entry">
+                        <div className="openrouter-model-entry-label">Model ID <span className="muted">(matched against your model list first)</span></div>
+                        <div className="openrouter-model-entry-row">
+                          <input
+                            value={openRouterModelId}
+                            onChange={(e) => setOpenRouterModelId(e.target.value)}
+                            placeholder="qwen/qwen3.8-max"
+                            aria-label="Model ID"
+                            onKeyDown={(e) => {
+                              if (e.key !== 'Enter') return
+                              e.preventDefault()
+                              useTypedModel()
+                            }}
+                          />
+                          <button
+                            className="btn small primary"
+                            disabled={!openRouterModelId.trim()}
+                            onClick={useTypedModel}
+                          >
+                            Use
+                          </button>
+                        </div>
+                      </div>
                       {filteredModels.length === 0 && <div className="model-empty">{modelList.length ? 'No models match' : 'No models available'}</div>}
-                      {filteredModels.map((m) => (
-                        <button
-                          key={m.key}
-                          className={`popover-option ${m.key === activeModelRaw || m.id === activeModelRaw ? 'selected' : ''}`}
-                          onClick={() => {
-                            setChosenModel(m.key)
-                            onSelectModel?.(m.key)
-                            setShowModelPicker(false)
-                            setPickerView('main')
-                            setModelQuery('')
-                          }}
-                        >
-                        <span className="popover-model-label">
-                          <span>{m.name || shortModelName(m.key)}</span>
-                          {(m.provider || m.key.includes('/')) && (
-                            <span className="popover-model-provider">{m.provider || m.key.split('/')[0]}</span>
+                      {modelGroups.map(([provider, items]) => (
+                        <div className="model-group" key={provider || 'other'} role="group" aria-label={provider || 'Other models'}>
+                          {modelGroups.length > 1 && (
+                            <div className="model-group-head">{provider || 'Other'}<span>{items.length}</span></div>
                           )}
-                        </span>
-                          {(m.key === activeModelRaw || m.id === activeModelRaw) && <CheckIcon />}
-                        </button>
+                          {items.map((m) => (
+                            <button
+                              key={m.key}
+                              className={`popover-option ${m.key === activeModelRaw || m.id === activeModelRaw ? 'selected' : ''}`}
+                              onClick={() => {
+                                setChosenModel(m.key)
+                                onSelectModel?.(m.key)
+                                setShowModelPicker(false)
+                                setPickerView('main')
+                                setModelQuery('')
+                              }}
+                            >
+                              <span className="popover-model-label">
+                                <span>{m.name || shortModelName(m.key)}</span>
+                                {modelGroups.length === 1 && modelProvider(m) && (
+                                  <span className="popover-model-provider">{modelProvider(m)}</span>
+                                )}
+                              </span>
+                              {(m.key === activeModelRaw || m.id === activeModelRaw) && <CheckIcon />}
+                            </button>
+                          ))}
+                        </div>
                       ))}
                     </div>
                   </div>
@@ -536,7 +609,7 @@ export default function Composer({
                       <ChevronLeftIcon />
                       <span>Effort</span>
                     </button>
-                    {EFFORT_LEVELS.map((lvl) => (
+                    {THINKING_LEVELS.map((lvl) => (
                       <button
                         key={lvl}
                         className={`popover-option ${lvl === effortLevel ? 'selected' : ''}`}
@@ -546,11 +619,11 @@ export default function Composer({
                           setPickerView('main')
                         }}
                       >
-                        <span>{lvl}</span>
+                        <span>{thinkingLabel(lvl)}</span>
                         {lvl === effortLevel && <CheckIcon />}
                       </button>
                     ))}
-                    <div className="popover-note">Consumes usage limits faster at higher levels</div>
+                    <div className="popover-note">Higher levels think longer and use more tokens. Not every model supports every level.</div>
                   </div>
                 )}
 
@@ -568,11 +641,6 @@ export default function Composer({
               </div>
             )}
           </div>
-
-          {/* Mic button */}
-          <button className="toolbar-icon-btn mic-btn" title="Voice input" disabled>
-            <MicIcon />
-          </button>
 
           {/* Send / Abort */}
           {busy ? (
@@ -655,15 +723,6 @@ function CheckIcon() {
   return (
     <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.5">
       <polyline points="20 6 9 17 4 12" />
-    </svg>
-  )
-}
-
-function MicIcon() {
-  return (
-    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <rect x="9" y="2" width="6" height="11" rx="3" />
-      <path d="M5 10a7 7 0 0014 0M12 19v3M8 22h8" />
     </svg>
   )
 }
