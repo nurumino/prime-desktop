@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import type { ActionQueue, SideQuestionTurn } from '@shared/types'
 import type { ModelOption } from '@shared/models'
 import MessageItem from './MessageItem'
+import WorkingMark from './WorkingMark'
+import ConfirmButton from './ConfirmButton'
 import Composer from './Composer'
-import type { AccessMode } from './AccessPicker'
 import type { RenderMessage } from '../lib/store'
 
 interface Props {
@@ -16,14 +17,14 @@ interface Props {
   commands?: { name: string; description?: string }[]
   effortLevel?: string
   onSelectEffort?: (effort: string) => void
-  accessMode?: AccessMode
-  onAccessModeChange?: (mode: AccessMode) => void
   rlmMaxDepth?: number
   onDepthChange?: (depth: number) => void
   onSlash?: (text: string) => void
   onBash?: (command: string) => void
   showReasoning?: boolean
   onToast?: (text: string, kind?: 'info' | 'success' | 'warning' | 'error') => void
+  contextPercent?: number | null
+  status?: ReactNode
 }
 
 interface SideRun {
@@ -45,19 +46,17 @@ export default function HarnessTray({
   commands = [],
   effortLevel,
   onSelectEffort,
-  accessMode,
-  onAccessModeChange,
   rlmMaxDepth,
   onDepthChange,
   onSlash,
   onBash,
   showReasoning = true,
-  onToast
+  onToast,
+  contextPercent = null,
+  status
 }: Props): JSX.Element {
   const [queue, setQueue] = useState<ActionQueue>(EMPTY_QUEUE)
-  const [open, setOpen] = useState(false)
-  const [lane, setLane] = useState<'steering' | 'followUp'>('steering')
-  const [queuedText, setQueuedText] = useState('')
+  const [queueCollapsed, setQueueCollapsed] = useState(false)
   const [sideHost, setSideHost] = useState<HTMLElement | null>(null)
   const [turns, setTurns] = useState<SideQuestionTurn[]>([])
   const [sideRun, setSideRun] = useState<SideRun | null>(null)
@@ -76,12 +75,22 @@ export default function HarnessTray({
     return () => observer.disconnect()
   }, [])
 
+  // Reset per-agent state only when the agent changes. This used to share an
+  // effect with the busy-dependent poll, which wiped the side chat whenever
+  // the main agent started or finished a run.
   useEffect(() => {
     setQueue(EMPTY_QUEUE)
     setTurns([])
     setSideRun(null)
+  }, [agentId])
+
+  useEffect(() => {
     loadQueue()
     const timer = window.setInterval(loadQueue, busy ? 1200 : 4000)
+    return () => window.clearInterval(timer)
+  }, [busy, loadQueue])
+
+  useEffect(() => {
     const off = window.prime.onEvent((raw) => {
       const message = raw as { agentId?: string; type?: string; payload?: Record<string, unknown> }
       if (message.agentId !== agentId) return
@@ -104,11 +113,8 @@ export default function HarnessTray({
         })
       }
     })
-    return () => {
-      window.clearInterval(timer)
-      off()
-    }
-  }, [agentId, busy, loadQueue])
+    return off
+  }, [agentId])
 
   useEffect(() => {
     if (sideRun?.status !== 'complete') return
@@ -142,15 +148,9 @@ export default function HarnessTray({
     }
   }
 
-  const addQueued = () => {
-    const text = queuedText.trim()
-    if (!text) return
-    const command = lane === 'steering' ? { type: 'steer', message: text } : { type: 'follow_up', message: text }
-    void window.prime.agentCommand(agentId, command as never)
-      .then(() => {
-        setQueuedText('')
-        loadQueue()
-      })
+  const queueAction = (action: 'queue_send_now' | 'queue_clear' | 'queue_abort_clear') => {
+    void window.prime.agentHarness(agentId, action)
+      .then((value) => setQueue(value as ActionQueue))
       .catch((error: Error) => onToast?.(error.message, 'error'))
   }
 
@@ -173,6 +173,8 @@ export default function HarnessTray({
   })
 
   const count = queue.steering.length + queue.followUp.length
+  const showContext = contextPercent != null && contextPercent >= 1
+  const contextTone = contextPercent == null ? 'ok' : contextPercent >= 90 ? 'high' : contextPercent >= 70 ? 'warn' : 'ok'
   const sideMessages: RenderMessage[] = turns.flatMap((turn, index) => [
     { id: `side-user-${index}`, role: 'user', content: turn.question },
     { id: `side-assistant-${index}`, role: 'assistant', content: turn.answer }
@@ -190,52 +192,64 @@ export default function HarnessTray({
   }
   return (
     <>
-      {count > 0 && (
-        <div className="harness-controls" aria-label="Queued session messages">
-          <button className={`harness-control ${open ? 'active' : ''}`} type="button" onClick={() => setOpen((value) => !value)}>
-            Queued messages · {count}
-          </button>
-        </div>
-      )}
+      <div className="harness-tray">
+        {count > 0 && (
+          <section className="queue-stack" aria-label="Queued messages">
+            <header className="queue-stack-head">
+              <button type="button" className="disclosure-head" aria-expanded={!queueCollapsed} onClick={() => setQueueCollapsed((value) => !value)}>
+                <span className="disclosure-label">Queued</span>
+                <span className="disclosure-count">{count} {count === 1 ? 'message' : 'messages'} · {busy ? 'sent at the next turn boundary' : 'sent when the agent is free'}</span>
+              </button>
+              <div className="queue-stack-actions">
+                {queue.sendQueuedSupported && busy && queue.steering.length > 0 && (
+                  <button type="button" className="btn ghost small" onClick={() => queueAction('queue_send_now')}>Interrupt & send</button>
+                )}
+                <ConfirmButton className="btn ghost small" confirmLabel="Clear all?" onConfirm={() => queueAction('queue_clear')}>Clear</ConfirmButton>
+                {busy && (
+                  <ConfirmButton className="btn ghost small danger" confirmLabel="Stop agent and clear?" onConfirm={() => queueAction('queue_abort_clear')}>Stop & clear</ConfirmButton>
+                )}
+              </div>
+            </header>
+            {!queueCollapsed && (
+              <ol className="queue-list">
+                {queue.steering.map((text, index) => (
+                  <QueueItem key={`s-${index}-${text}`} lane="steering" index={index} text={text} total={queue.steering.length} editable={queue.mutationSupported === true} onMutate={mutate} />
+                ))}
+                {queue.followUp.map((text, index) => (
+                  <QueueItem key={`f-${index}-${text}`} lane="followUp" index={index} text={text} total={queue.followUp.length} editable={queue.mutationSupported === true} onMutate={mutate} />
+                ))}
+              </ol>
+            )}
+          </section>
+        )}
 
-      {open && count > 0 && (
-        <section className="harness-popover queue-popover">
-          <header>
-            <strong>Admission queue</strong>
-            <span>{busy ? 'Agent is working' : 'Agent is idle'}</span>
-          </header>
-          <div className="queue-compose">
-            <select value={lane} onChange={(event) => setLane(event.target.value as typeof lane)}>
-              <option value="steering">Steer next</option>
-              <option value="followUp">Follow up</option>
-            </select>
-            <input
-              value={queuedText}
-              placeholder={lane === 'steering' ? 'Interrupt at next turn boundary' : 'Run when idle'}
-              onChange={(event) => setQueuedText(event.target.value)}
-              onKeyDown={(event) => { if (event.key === 'Enter') addQueued() }}
-            />
-            <button type="button" onClick={addQueued}>Add</button>
+        {(status || showContext) && (
+          <div className="harness-controls" aria-label="Session controls">
+            {status}
+            <div className="harness-pills">
+              {showContext && (
+                <div
+                  className={`context-pill ${contextTone}`}
+                  title={`Context window ${Math.round(contextPercent ?? 0)}% used`}
+                >
+                  <span className="context-pill-meter" aria-hidden="true">
+                    <i style={{ width: `${Math.min(100, Math.round(contextPercent ?? 0))}%` }} />
+                  </span>
+                  <span>{Math.round(contextPercent ?? 0)}%</span>
+                </div>
+              )}
+            </div>
           </div>
-          <QueueLane label="Steering" lane="steering" items={queue.steering} editable={queue.mutationSupported === true} onMutate={mutate} />
-          <QueueLane label="Follow-up" lane="followUp" items={queue.followUp} editable={queue.mutationSupported === true} onMutate={mutate} />
-          {count > 0 && (
-            <footer>
-              <button type="button" onClick={() => void window.prime.agentHarness(agentId, 'queue_clear').then((value) => setQueue(value as ActionQueue))}>Clear queued</button>
-              <button className="danger" type="button" onClick={() => void window.prime.agentHarness(agentId, 'queue_abort_clear').then((value) => setQueue(value as ActionQueue))}>Abort & clear</button>
-            </footer>
-          )}
-        </section>
-      )}
+        )}
+      </div>
 
       {sideHost && createPortal(
         <section className="side-thread-chat">
-          <div className="side-thread-intro">Independent from the main transcript</div>
           <div className="side-thread-turns sp-chat-feed">
-            {sideMessages.map((message) => <MessageItem key={message.id} message={message} toolExecs={{}} showReasoning={showReasoning} />)}
+            {sideMessages.map((message) => <MessageItem key={message.id} message={message} toolExecs={{}} showReasoning={showReasoning} turnComplete={sideRun?.status !== 'running'} />)}
             {sideRun?.status === 'running' && !sideRun.answer && (
               <div className="assistant-pending" role="status">
-                <span className="assistant-pending-shimmer">Thinking…</span>
+                <WorkingMark />
               </div>
             )}
             {sideRun && (sideRun.status === 'error' || sideRun.status === 'cancelled') && (
@@ -264,8 +278,6 @@ export default function HarnessTray({
             onSelectModel={onSelectModel}
             effortLevel={effortLevel}
             onSelectEffort={onSelectEffort}
-            accessMode={accessMode}
-            onAccessModeChange={onAccessModeChange}
             rlmMaxDepth={rlmMaxDepth}
             onDepthChange={onDepthChange}
             showContext={false}
@@ -277,44 +289,91 @@ export default function HarnessTray({
   )
 }
 
-function QueueLane({
-  label,
+function QueueItem({
   lane,
-  items,
+  index,
+  text,
+  total,
   editable,
   onMutate
 }: {
-  label: string
   lane: 'steering' | 'followUp'
-  items: string[]
+  index: number
+  text: string
+  total: number
   editable: boolean
   onMutate: (lane: 'steering' | 'followUp', index: number, expectedText: string, mutation: Record<string, unknown>) => void
 }): JSX.Element {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(text)
+  const other = lane === 'steering' ? 'followUp' : 'steering'
+
+  const save = () => {
+    const next = draft.trim()
+    setEditing(false)
+    if (next && next !== text) onMutate(lane, index, text, { type: 'replace', text: next, lane })
+    else setDraft(text)
+  }
+
   return (
-    <div className="queue-lane">
-      <div className="queue-lane-title">{label}<span>{items.length}</span></div>
-      {items.length === 0 && <div className="queue-empty">Empty</div>}
-      {items.map((text, index) => (
-        <div className="queue-item" key={`${index}-${text}`}>
-          <input
-            defaultValue={text}
-            readOnly={!editable}
-            aria-label={`${label} queued message ${index + 1}`}
-            onBlur={(event) => {
-              const next = event.target.value.trim()
-              if (editable && next && next !== text) onMutate(lane, index, text, { type: 'replace', text: next, lane })
-            }}
-          />
-          {editable && (
-            <div className="queue-item-actions">
-              <button type="button" disabled={index === 0} aria-label="Move up" onClick={() => onMutate(lane, index, text, { type: 'move', direction: -1 })}>↑</button>
-              <button type="button" disabled={index === items.length - 1} aria-label="Move down" onClick={() => onMutate(lane, index, text, { type: 'move', direction: 1 })}>↓</button>
-              <button type="button" aria-label={`Move to ${lane === 'steering' ? 'follow-up' : 'steering'}`} onClick={() => onMutate(lane, index, text, { type: 'replace', text, lane: lane === 'steering' ? 'followUp' : 'steering' })}>⇄</button>
-              <button type="button" aria-label="Delete queued message" onClick={() => onMutate(lane, index, text, { type: 'delete' })}>×</button>
-            </div>
-          )}
-        </div>
-      ))}
-    </div>
+    <li className={`queue-item ${lane}`}>
+      <span className="queue-lane-tag" title={lane === 'steering' ? 'Delivered at the next turn boundary' : 'Sent after the current run finishes'}>
+        {lane === 'steering' ? 'Steer' : 'Follow-up'}
+      </span>
+      {editing ? (
+        <textarea
+          className="queue-item-edit"
+          autoFocus
+          rows={Math.min(5, Math.max(1, Math.ceil(draft.length / 70)))}
+          value={draft}
+          aria-label="Edit queued message"
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={save}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault()
+              save()
+            } else if (event.key === 'Escape') {
+              setDraft(text)
+              setEditing(false)
+            }
+          }}
+        />
+      ) : (
+        <span className="queue-item-text" title={text}>{text}</span>
+      )}
+      {editable && !editing && (
+        <span className="queue-item-actions">
+          <button type="button" title="Edit" aria-label="Edit queued message" onClick={() => { setDraft(text); setEditing(true) }}>
+            <QueueIcon d="M4 20h4L19 9l-4-4L4 16v4z" />
+          </button>
+          <button type="button" title="Move up" aria-label="Move up" disabled={index === 0} onClick={() => onMutate(lane, index, text, { type: 'move', direction: -1 })}>
+            <QueueIcon d="M12 19V5M6 11l6-6 6 6" />
+          </button>
+          <button type="button" title="Move down" aria-label="Move down" disabled={index === total - 1} onClick={() => onMutate(lane, index, text, { type: 'move', direction: 1 })}>
+            <QueueIcon d="M12 5v14M6 13l6 6 6-6" />
+          </button>
+          <button
+            type="button"
+            title={other === 'steering' ? 'Steer instead (deliver at next turn boundary)' : 'Make a follow-up (send after this run)'}
+            aria-label={other === 'steering' ? 'Change to steer' : 'Change to follow-up'}
+            onClick={() => onMutate(lane, index, text, { type: 'replace', text, lane: other })}
+          >
+            <QueueIcon d="M7 7h11l-3-3M17 17H6l3 3" />
+          </button>
+          <button type="button" title="Remove" aria-label="Remove queued message" onClick={() => onMutate(lane, index, text, { type: 'delete' })}>
+            <QueueIcon d="M6 6l12 12M18 6L6 18" />
+          </button>
+        </span>
+      )}
+    </li>
+  )
+}
+
+function QueueIcon({ d }: { d: string }): JSX.Element {
+  return (
+    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={d} />
+    </svg>
   )
 }

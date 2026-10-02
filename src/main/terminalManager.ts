@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events'
 import { spawn, type IPty } from 'node-pty'
+import { existsSync } from 'fs'
 
 const MAX_BUFFER = 200_000
 
@@ -25,19 +26,20 @@ export class TerminalManager extends EventEmitter {
     const existing = this.sessions.get(agentId)
     if (existing) return this.snapshot(existing)
 
-    const shell = process.env.SHELL || '/bin/zsh'
+    const shell = resolveShell()
+    const resolvedCwd = existsSync(cwd) ? cwd : process.env.HOME || '/'
     const pty = spawn(shell, ['-l'], {
       name: 'xterm-256color',
       cols: clamp(cols, 20, 500),
       rows: clamp(rows, 5, 200),
-      cwd,
+      cwd: resolvedCwd,
       env: {
         ...process.env,
         TERM: 'xterm-256color',
         COLORTERM: 'truecolor'
       } as Record<string, string>
     })
-    const session: TerminalSession = { process: pty, cwd, buffer: '', offset: 0 }
+    const session: TerminalSession = { process: pty, cwd: resolvedCwd, buffer: '', offset: 0 }
     this.sessions.set(agentId, session)
 
     pty.onData((data) => {
@@ -99,4 +101,13 @@ export class TerminalManager extends EventEmitter {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.floor(value)))
+}
+
+function resolveShell(): string {
+  const configured = process.env.SHELL
+  if (configured && configured.startsWith('/') && existsSync(configured)) return configured
+  for (const shell of ['/bin/zsh', '/bin/bash', '/bin/sh']) {
+    if (existsSync(shell)) return shell
+  }
+  return '/bin/sh'
 }

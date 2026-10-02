@@ -1,10 +1,12 @@
 import { BrowserWindow, dialog, ipcMain as electronIpcMain, Notification, shell, app, nativeTheme, type IpcMainInvokeEvent } from 'electron'
+import { readFile, stat } from 'fs/promises'
 import { AgentManager } from './agentManager'
 import { BinaryManager } from './binary'
-import { getState, setSessionPinned, setSettings, setTabs } from './store'
-import { listRules, addRule, removeRule } from './permissions'
+import { listExternalSessions } from './daemonTransport'
+import { getCustomProviders, refreshOpenRouterModels, removeCustomProvider, setCustomProvider } from './primeFiles'
+import { addPreviewFile, getState, setSessionPinned, setSettings, setTabs } from './store'
 import { IPC, type AgentCommand, type ProjectTab, type AutonomousConfig } from '@shared/types'
-import { basename, join, resolve as resolvePath } from 'path'
+import { basename, extname, join, resolve as resolvePath } from 'path'
 import { randomUUID } from 'crypto'
 import { TerminalManager } from './terminalManager'
 import { resolveThemeMode } from '@shared/themes'
@@ -22,11 +24,54 @@ import {
   assertTrustedRenderer,
   requireExistingDirectory,
   requireExistingFile,
-  requireFiniteNumber,
   requireNonEmptyString,
   requireSafeExternalUrl,
+  requireString,
+  isWithin,
   validateAgentCommand
 } from './ipcSecurity'
+
+async function readPreviewFile(file: string): Promise<{ path: string; size: number; mime: string; content?: string; dataUrl?: string }> {
+  const info = await stat(file)
+  const extension = extname(file).toLowerCase()
+  const binaryPreviewMime: Record<string, string> = {
+    '.pdf': 'application/pdf',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.xls': 'application/vnd.ms-excel'
+  }
+  const maxSize = binaryPreviewMime[extension] ? 32 * 1024 * 1024 : 8 * 1024 * 1024
+  if (info.size > maxSize) throw new Error('Artifact is too large to preview')
+  const imageMime: Record<string, string> = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.svg': 'image/svg+xml'
+  }
+  if (imageMime[extension]) {
+    const data = (await readFile(file)).toString('base64')
+    return { path: file, size: info.size, mime: imageMime[extension], dataUrl: `data:${imageMime[extension]};base64,${data}` }
+  }
+  if (binaryPreviewMime[extension]) {
+    const data = (await readFile(file)).toString('base64')
+    const mime = binaryPreviewMime[extension]
+    return { path: file, size: info.size, mime, dataUrl: `data:${mime};base64,${data}` }
+  }
+  return { path: file, size: info.size, mime: 'text/plain', content: await readFile(file, 'utf8') }
+}
+
+// Files outside the agent-scoped artifact APIs: only open projects or files
+// the user explicitly picked in the native dialog.
+async function requirePreviewableFile(rawPath: unknown): Promise<string> {
+  const file = requireExistingFile(rawPath, 'path')
+  const state = await getState()
+  if (state.tabs.some((tab) => isWithin(tab.path, file))) return file
+  if (state.previewFiles.includes(file)) return file
+  throw new Error('File is not in an open project or a file you opened')
+}
 
 export function registerIpc(win: () => BrowserWindow | null, manager: AgentManager, binary: BinaryManager): void {
   const terminals = new TerminalManager()
@@ -107,7 +152,7 @@ export function registerIpc(win: () => BrowserWindow | null, manager: AgentManag
     const s = await getState()
     const tabs = s.tabs.filter((t) => t.id !== tabId)
     const activeTabId = s.activeTabId === tabId ? (tabs[0]?.id ?? null) : s.activeTabId
-    manager.closeAgent(`agent-${tabId}`)
+    manager.closeTab(tabId)
     terminals.close(`agent-${tabId}`)
     await setTabs(tabs, activeTabId)
     return { tabs, activeTabId }
@@ -149,7 +194,9 @@ export function registerIpc(win: () => BrowserWindow | null, manager: AgentManag
     if (!sessions.some((session) => resolvePath(session.sessionFile) === target)) {
       throw new Error('Session does not belong to this project')
     }
-    return manager.resumeSession(agentId, target)
+    // Opening a chat never interrupts a running one: the manager focuses the
+    // chat if it's already live, or opens it in an idle or new slot.
+    return manager.openSession(agentId, target, (await getState()).settings)
   })
   ipcMain.handle(IPC.agentSessionDelete, async (_e, agentId: string, sessionPath: string) => {
     const sessions = await manager.getSessions(agentId)
@@ -162,8 +209,8 @@ export function registerIpc(win: () => BrowserWindow | null, manager: AgentManag
     return remaining
   })
   ipcMain.handle(IPC.sessionPinsGet, async () => (await getState()).pinnedSessionFiles)
-  ipcMain.handle(IPC.sessionPinSet, (_e, sessionPath: string, pinned: boolean) =>
-    setSessionPinned(sessionPath, pinned))
+  ipcMain.handle(IPC.sessionPinSet, (_e, sessionPath: unknown, pinned: unknown) =>
+    setSessionPinned(requireString(sessionPath, 'session path', 4_096), pinned === true))
   ipcMain.handle(IPC.agentCommands, (_e, agentId: string) => manager.getCommands(agentId))
   ipcMain.handle(
     IPC.agentHarness,
@@ -203,30 +250,79 @@ export function registerIpc(win: () => BrowserWindow | null, manager: AgentManag
   ipcMain.handle(IPC.fleetHeartbeat, (_e, agentId: string) => manager.getHeartbeat(agentId))
   ipcMain.handle(IPC.fleetHeartbeatAction, (_e, agentId: string, action: string) => manager.heartbeatAction(agentId, action))
 
+  ipcMain.handle(IPC.externalList, () => listExternalSessions(binary.getBinary()))
+  ipcMain.handle(IPC.externalMessage, (_e, target: unknown, message: unknown) =>
+    manager.messageExternal(String(target ?? ''), String(message ?? ''))
+  )
+
+  ipcMain.handle(IPC.modelsCustomGet, () => getCustomProviders())
+  ipcMain.handle(IPC.modelsCustomSet, (_e, config: unknown) => {
+    const raw = (config ?? {}) as Record<string, unknown>
+    const models = Array.isArray(raw.models) ? raw.models as { id?: unknown; name?: unknown }[] : []
+    return setCustomProvider({
+      provider: String(raw.provider ?? ''),
+      baseUrl: String(raw.baseUrl ?? ''),
+      api: typeof raw.api === 'string' ? raw.api : undefined,
+      apiKey: typeof raw.apiKey === 'string' ? raw.apiKey : undefined,
+      models: models.map((model) => ({ id: String(model?.id ?? ''), name: typeof model?.name === 'string' ? model.name : undefined }))
+    }).then(async (providers) => {
+      await manager.reloadAgents()
+      return providers
+    })
+  })
+  ipcMain.handle(IPC.modelsCustomRemove, (_e, providerId: unknown) =>
+    removeCustomProvider(String(providerId ?? '')).then(async (providers) => {
+      await manager.reloadAgents()
+      return providers
+    })
+  )
+  ipcMain.handle(IPC.modelsOpenRouterRefresh, async (_e, agentId: string) => {
+    const settings = (await getState()).settings
+    await refreshOpenRouterModels()
+    return manager.runCommand(agentId, { type: 'get_available_models' }, settings)
+  })
+
   ipcMain.handle(IPC.gitList, (_e, agentId: string) => manager.listCheckpoints(agentId))
   ipcMain.handle(IPC.gitRestore, (_e, agentId: string, sha: string) => manager.restoreCheckpoint(agentId, sha))
   ipcMain.handle(IPC.gitDiffFiles, (_e, agentId: string) => manager.diffFiles(agentId))
   ipcMain.handle(IPC.gitStatus, (_e, agentId: string) => manager.gitStatus(agentId))
   ipcMain.handle(IPC.gitFileDiff, (_e, agentId: string, path: string, staged: boolean) =>
     manager.gitFileDiff(agentId, path, staged))
+  ipcMain.handle(IPC.artifactChoose, async () => {
+    const w = win()
+    const res = w
+      ? await dialog.showOpenDialog(w, { properties: ['openFile'] })
+      : await dialog.showOpenDialog({ properties: ['openFile'] })
+    const picked = res.canceled ? undefined : res.filePaths[0]
+    if (!picked) return null
+    await addPreviewFile(picked)
+    return resolvePath(picked)
+  })
+  ipcMain.handle(IPC.artifactReadFile, async (_e, rawPath: unknown) =>
+    readPreviewFile(await requirePreviewableFile(rawPath)))
+  ipcMain.handle(IPC.artifactRead, async (_e, agentId: string, rawPath: string) => {
+    const projectPath = manager.getProjectPath(agentId)
+    if (!projectPath) throw new Error('Project is not available')
+    const requested = requireNonEmptyString(rawPath, 'artifact path', 4_096)
+    const filePath = resolvePath(projectPath, requested)
+    if (!isWithin(projectPath, filePath)) throw new Error('Artifact path is outside the project')
+    const file = requireExistingFile(filePath, 'artifact path')
+    return readPreviewFile(file)
+  })
+  ipcMain.handle(IPC.artifactReveal, (_e, agentId: string, rawPath: string) => {
+    const projectPath = manager.getProjectPath(agentId)
+    if (!projectPath) throw new Error('Project is not available')
+    const requested = requireNonEmptyString(rawPath, 'artifact path', 4_096)
+    const filePath = resolvePath(projectPath, requested)
+    if (!isWithin(projectPath, filePath)) throw new Error('Artifact path is outside the project')
+    shell.showItemInFolder(requireExistingFile(filePath, 'artifact path'))
+    return true
+  })
   ipcMain.handle(IPC.gitStage, (_e, agentId: string, paths: string[]) => manager.gitStage(agentId, paths))
   ipcMain.handle(IPC.gitUnstage, (_e, agentId: string, paths: string[]) => manager.gitUnstage(agentId, paths))
   ipcMain.handle(IPC.gitStageAll, (_e, agentId: string) => manager.gitStageAll(agentId))
   ipcMain.handle(IPC.gitUnstageAll, (_e, agentId: string) => manager.gitUnstageAll(agentId))
   ipcMain.handle(IPC.gitCommit, (_e, agentId: string, message: string) => manager.gitCommit(agentId, message))
-
-  ipcMain.handle(IPC.permissionsList, () => listRules())
-  ipcMain.handle(IPC.permissionsSet, (_e, pattern: string, action: 'allow' | 'deny', scope: 'global' | 'project', projectPath?: string) =>
-    addRule({
-      pattern: requireNonEmptyString(pattern, 'pattern', 4_096),
-      action: action === 'deny' ? 'deny' : 'allow',
-      scope: scope === 'project' ? 'project' : 'global',
-      projectPath: scope === 'project' && projectPath ? requireExistingDirectory(projectPath, 'project path') : undefined
-    })
-  )
-  ipcMain.handle(IPC.permissionsRemove, (_e, index: number) =>
-    removeRule(requireFiniteNumber(index, 'rule index', 0, 100_000))
-  )
 
   ipcMain.handle(IPC.dashboardSpend, () => manager.spend())
   ipcMain.handle(IPC.dashboardModels, async () => {
@@ -287,7 +383,7 @@ export function registerIpc(win: () => BrowserWindow | null, manager: AgentManag
     return settings
   })
 
-  ipcMain.handle(IPC.revealInFinder, (_e, path: string) => shell.showItemInFolder(requireExistingFile(path, 'path')))
+  ipcMain.handle(IPC.revealInFinder, async (_e, path: unknown) => shell.showItemInFolder(await requirePreviewableFile(path)))
   ipcMain.handle(IPC.openExternal, (_e, url: string) => shell.openExternal(requireSafeExternalUrl(url)))
   ipcMain.handle(IPC.quit, () => app.quit())
 
@@ -297,8 +393,7 @@ export function registerIpc(win: () => BrowserWindow | null, manager: AgentManag
   )
   ipcMain.handle(IPC.authRemove, (_e, provider: string) => removeAuth(requireNonEmptyString(provider, 'provider', 128)))
   ipcMain.handle(IPC.authOpenTui, () => {
-    openPrimeAgentLogin()
-    return true
+    return openPrimeAgentLogin(binary.getBinary())
   })
   ipcMain.handle(IPC.rlmGet, async (_e, agentId: string) => {
     const s = await getState()

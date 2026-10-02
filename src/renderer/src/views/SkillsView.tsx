@@ -14,6 +14,8 @@ export default function SkillsView({ activeAgentId }: Props): JSX.Element {
   const [packageOutput, setPackageOutput] = useState('')
   const [mcpServers, setMcpServers] = useState<Record<string, McpServer>>({})
   const [mcpDraft, setMcpDraft] = useState({ name: '', url: '', oauth: true, enabled: true, bearerTokenEnvVar: '' })
+  const [services, setServices] = useState<{ id: string; name: string; description: string; auth: string }[]>([])
+  const [serviceQuery, setServiceQuery] = useState('')
 
   useEffect(() => {
     load()
@@ -30,6 +32,7 @@ export default function SkillsView({ activeAgentId }: Props): JSX.Element {
     void window.prime.agentHarness(activeAgentId ?? '', 'mcp_get').then((value) => {
       setMcpServers((value as { servers?: Record<string, McpServer> }).servers ?? {})
     })
+    void window.prime.agentHarness('', 'mcp_catalog').then(value => setServices(value as typeof services)).catch(() => setServices([]))
   }
 
   const packageAction = (command: 'install' | 'remove' | 'update', source = '') => {
@@ -49,9 +52,18 @@ export default function SkillsView({ activeAgentId }: Props): JSX.Element {
   return (
     <div className="view plugins-page">
       <header className="view-header">
-        <div>
-        <h2>Resources</h2>
-        <p className="view-sub">Prime Agent packages, extensions, skills, prompts, themes, and MCP servers.</p>
+        <div className="view-heading">
+          <span className="view-chip chip-resources" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 8l-9-5-9 5 9 5 9-5z" />
+              <path d="M3 8v8l9 5 9-5V8" />
+              <path d="M12 13v8" />
+            </svg>
+          </span>
+          <div>
+            <h2>Resources</h2>
+            <p className="view-sub">Prime Agent packages, extensions, skills, prompts, themes, and MCP servers.</p>
+          </div>
         </div>
       </header>
 
@@ -162,6 +174,30 @@ export default function SkillsView({ activeAgentId }: Props): JSX.Element {
         {resources && Object.values(resources.diagnostics).flat().map((diagnostic, index) => (
           <div className={`resource-diagnostic ${diagnostic.type}`} key={`${index}-${diagnostic.message}`}>
             <strong>{diagnostic.type}</strong> {diagnostic.message}
+          </div>
+        ))}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">Connect services <span className="panel-count">{services.length}</span></div>
+        <p className="setting-desc">
+          Use Prime Agent’s connection manager for OAuth and API keys. Open it below, then type <code>/plugins</code>.
+          Connections share the same credential store as this app.
+        </p>
+        <div className="row-gap pad-top">
+          <input className="field grow" aria-label="Search services" placeholder="Search services"
+            value={serviceQuery} onChange={event => setServiceQuery(event.target.value)} />
+          <button className="btn small" onClick={() => void window.prime.authOpenTui()}>Open Prime Agent</button>
+        </div>
+        {serviceQuery.trim() && services.filter(service =>
+          `${service.name} ${service.description}`.toLowerCase().includes(serviceQuery.toLowerCase())
+        ).map(service => (
+          <div className="plugin-row" key={service.id}>
+            <div className="plugin-copy">
+              <div className="skill-name">{service.name}</div>
+              <div className="skill-desc">{service.description}</div>
+            </div>
+            <span className="skill-loc">{service.auth === 'oauth' ? 'OAuth' : service.auth === 'api_key' ? 'API key' : service.auth}</span>
           </div>
         ))}
       </section>

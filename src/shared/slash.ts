@@ -242,6 +242,7 @@ export function dispatchSlash(raw: string): SlashDispatch | null {
 }
 
 export const HOTKEYS: { keys: string; action: string }[] = [
+  { keys: '⌘K', action: 'Open the command palette' },
   { keys: 'Enter', action: 'Send, or steer while the agent is working' },
   { keys: 'Shift+Enter', action: 'New line' },
   { keys: 'Escape', action: 'Close palettes without interrupting' },

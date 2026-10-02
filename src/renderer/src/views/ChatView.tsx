@@ -1,23 +1,120 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AgentInfo, GoalState, ProjectTab, SubagentNode, ViewId } from '@shared/types'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { AgentInfo, Artifact, GoalState, ProjectTab, SubagentNode, ViewId } from '@shared/types'
 import type { GitStatus } from '@shared/types'
 import { parseModelList, type ModelOption } from '@shared/models'
 import { dispatchSlash, type SlashOverlayId } from '@shared/slash'
 import Composer from '../components/Composer'
 import CloudMark from '../components/CloudMark'
-import MessageItem from '../components/MessageItem'
+import MessageItem, { formatWorkDuration, isFileEditBlock, WorkDurationRow } from '../components/MessageItem'
 import SubagentMark from '../components/SubagentMark'
 import SlashOverlay from '../components/SlashOverlay'
 import HarnessTray from '../components/HarnessTray'
-import type { Block, FleetEntry, RenderMessage, ToolExecState } from '../lib/store'
-import { mergeMessage as merge, finishToolExecs, patchToolExecs } from '../lib/store'
-import type { AccessMode } from '../components/AccessPicker'
-import { isInternalStateRestoreMessage } from '@shared/messageVisibility'
+import type { Block, FleetEntry, RenderMessage } from '../lib/store'
+import { useAgentThread, type AgentActivity } from '../lib/agentThread'
+import { isThinkingLevel } from '@shared/thinking'
 
-function renderMessages(items: unknown[]): RenderMessage[] {
-  return (items as Record<string, unknown>[])
-    .filter((item) => !isInternalStateRestoreMessage(item))
-    .reduce((acc, item) => merge(acc, item), [] as RenderMessage[])
+function artifactMtime(artifact: Artifact): number | null {
+  const s = String(artifact.diff ?? '').trim().replace(/^\+/, '').trim()
+  if (/^\d+(\.\d+)?$/.test(s)) return Number(s)
+  return null
+}
+
+function normalizeMessageId(m: RenderMessage): string | undefined {
+  if (m.id) return m.id
+  if (m.timestamp == null) return undefined
+  return `m-${String(m.timestamp)}-${String(m.role ?? '')}`
+}
+
+function displayedWorkDurations(
+  messages: RenderMessage[],
+  durations: Record<string, number>
+): Record<string, number> {
+  const displayed: Record<string, number> = {}
+  let firstAssistantId: string | null = null
+  let total = 0
+
+  const flush = () => {
+    if (firstAssistantId && total > 0) displayed[firstAssistantId] = total
+    firstAssistantId = null
+    total = 0
+  }
+
+  for (const message of messages) {
+    if (message.role === 'user') {
+      flush()
+      continue
+    }
+    if (message.role !== 'assistant') continue
+    firstAssistantId ??= message.id
+    total += durations[message.id] ?? 0
+  }
+  flush()
+  return displayed
+}
+
+function fileEditsAtTurnEnd(messages: RenderMessage[]): Map<string, Block[]> {
+  const byMessage = new Map<string, Block[]>()
+  let targetId: string | null = null
+  let edits: Block[] = []
+
+  const flush = () => {
+    if (targetId && edits.length > 0) byMessage.set(targetId, edits)
+    targetId = null
+    edits = []
+  }
+
+  for (const message of messages) {
+    if (message.role === 'user') {
+      flush()
+      continue
+    }
+    if (message.role !== 'assistant') continue
+    targetId = message.id
+    if (Array.isArray(message.content)) {
+      edits.push(...message.content.filter(isFileEditBlock))
+    }
+  }
+  flush()
+  return byMessage
+}
+
+function computeArtifactOwners(artifacts: Artifact[], messages: RenderMessage[]): Map<string, Artifact[]> {
+  const map = new Map<string, Artifact[]>()
+  const unmatched: Artifact[] = []
+  for (const a of artifacts) {
+    if (a.messageId) {
+      const list = map.get(a.messageId) ?? []
+      list.push(a)
+      map.set(a.messageId, list)
+    } else {
+      unmatched.push(a)
+    }
+  }
+  if (unmatched.length && messages.length) {
+    const userTs = messages
+      .filter((m) => m.role === 'user' && typeof m.timestamp === 'number')
+      .map((m) => m.timestamp as number)
+    const assistants = messages
+      .filter((m) => m.role === 'assistant' && typeof m.timestamp === 'number')
+    for (const a of unmatched) {
+      const mtime = artifactMtime(a)
+      if (mtime == null) continue
+      const nextUser = userTs.filter((t) => t > mtime).sort((x, y) => x - y)[0] ?? Infinity
+      const turnStart = userTs.filter((t) => t <= mtime).sort((x, y) => y - x)[0] ?? -Infinity
+      let owner: RenderMessage | undefined
+      for (const m of assistants) {
+        const t = m.timestamp as number
+        if (t > turnStart && t < nextUser) owner = m
+      }
+      const ownerId = owner ? normalizeMessageId(owner) : undefined
+      if (ownerId) {
+        const list = map.get(ownerId) ?? []
+        list.push(a)
+        map.set(ownerId, list)
+      }
+    }
+  }
+  return map
 }
 
 interface Props {
@@ -25,8 +122,6 @@ interface Props {
   info: AgentInfo | null
   tab: ProjectTab | null
   projects?: ProjectTab[]
-  accessMode?: AccessMode
-  onAccessModeChange?: (mode: AccessMode) => void
   onOpenSubagent?: (entry: FleetEntry) => void
   onSubagentActivity?: (entry: FleetEntry) => void
   onNavigate?: (view: ViewId) => void
@@ -40,28 +135,75 @@ interface Props {
   rlmMaxDepth?: number
   showReasoning?: boolean
   onDepthChange?: (depth: number) => void
+  artifacts?: Artifact[]
+  onOpenArtifacts?: (path?: string) => void
 }
 
-export default function ChatView({ agentId, info, tab: _tab, projects = [], accessMode = 'ask', onAccessModeChange, onOpenSubagent, onSubagentActivity, onNavigate, onOpenGit, onSelectProject, onNewProject, subagents = [], onOpenSubagents, showSubagentCard = true, onToast, rlmMaxDepth = 1, showReasoning = true, onDepthChange }: Props): JSX.Element {
-  const [messages, setMessages] = useState<RenderMessage[]>([])
-  const [toolExecs, setToolExecs] = useState<Record<string, ToolExecState>>({})
+export default function ChatView({ agentId, info, tab: _tab, projects = [], onOpenSubagent, onSubagentActivity, onNavigate, onOpenGit, onSelectProject, onNewProject, subagents = [], onOpenSubagents, showSubagentCard = true, onToast, rlmMaxDepth = 1, showReasoning = true, onDepthChange, artifacts = [], onOpenArtifacts }: Props): JSX.Element {
   const [commands, setCommands] = useState<{ name: string; description?: string }[]>([])
   const [models, setModels] = useState<ModelOption[]>([])
   const [branch, setBranch] = useState<string | null>(null)
   const [showJumpToLatest, setShowJumpToLatest] = useState(false)
-  const [awaitingResponse, setAwaitingResponse] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const layoutRef = useRef<HTMLDivElement>(null)
+
+  // The composer floats over the transcript and grows with the queue, status
+  // and banners. Publish its height so the last message is never hidden.
+  useEffect(() => {
+    const layout = layoutRef.current
+    const composer = layout?.querySelector<HTMLElement>(':scope > .composer-wrap')
+    if (!layout || !composer) return
+    const observer = new ResizeObserver(() => {
+      layout.style.setProperty('--composer-height', `${Math.ceil(composer.getBoundingClientRect().height)}px`)
+    })
+    observer.observe(composer)
+    return () => observer.disconnect()
+  }, [])
   const followLatestRef = useRef(true)
+  const busy = info?.isStreaming === true || info?.status === 'working'
+  const thread = useAgentThread(agentId, busy)
+  const { messages, toolExecs, awaitingResponse, pendingStartedAt, workStartedAt, workedDurations } = thread
+  const runningToolNames = useMemo(() => Object.values(toolExecs)
+    .filter((tool) => tool.status === 'running' || tool.status === 'pending')
+    .map((tool) => tool.toolName), [toolExecs])
+  const artifactOwners = useMemo(() => computeArtifactOwners(artifacts, messages), [artifacts, messages])
+  const visibleWorkedDurations = useMemo(
+    () => displayedWorkDurations(messages, workedDurations),
+    [messages, workedDurations]
+  )
+  const deferredFileEdits = useMemo(() => fileEditsAtTurnEnd(messages), [messages])
+  const currentAssistantId = useMemo(() => {
+    const lastUserIndex = messages.reduce((last, message, index) => message.role === 'user' ? index : last, -1)
+    return messages.slice(lastUserIndex + 1).find((message) => message.role === 'assistant')?.id ?? null
+  }, [messages])
+  const workRows = useMemo(() => {
+    const rows = new Map<string, { startedAt?: number; durationMs?: number; active?: boolean }>()
+    let firstAssistantInTurn = true
+    for (const message of messages) {
+      if (message.role === 'user') {
+        firstAssistantInTurn = true
+        continue
+      }
+      if (message.role !== 'assistant' || !firstAssistantInTurn) continue
+      firstAssistantInTurn = false
+      const durationMs = visibleWorkedDurations[message.id]
+      const active = (busy || awaitingResponse) && message.id === currentAssistantId
+      if (durationMs != null || active) {
+        rows.set(message.id, {
+          durationMs,
+          active,
+          startedAt: active ? (workStartedAt[message.id] ?? pendingStartedAt ?? undefined) : undefined
+        })
+      }
+    }
+    return rows
+  }, [awaitingResponse, busy, currentAssistantId, messages, pendingStartedAt, visibleWorkedDurations, workStartedAt])
+  const lastUserIndex = messages.reduce((last, message, index) => message.role === 'user' ? index : last, -1)
+  const pendingWorkIndex = (busy || awaitingResponse) && currentAssistantId == null ? lastUserIndex + 1 : -1
 
   useEffect(() => {
     followLatestRef.current = true
     setShowJumpToLatest(false)
-    setAwaitingResponse(false)
-    setMessages([])
-    setToolExecs({})
-    void window.prime.agentMessages(agentId).then((msgs) => {
-      setMessages(renderMessages(msgs))
-    })
     void window.prime.agentCommands(agentId).then((cmds) => {
       setCommands(
         (cmds as { name: string; description?: string }[]).map((c) => ({ name: c.name, description: c.description }))
@@ -75,7 +217,20 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
       })
     }
     loadModels()
+    const off = window.prime.onEvent((raw) => {
+      if ((raw as { type?: string }).type === 'models_changed') loadModels()
+    })
+    return off
   }, [agentId])
+
+  const refreshOpenRouterModels = useCallback(() => {
+    void window.prime.modelsOpenRouterRefresh(agentId)
+      .then((res) => {
+        setModels(parseModelList(res))
+        onToast?.('OpenRouter models refreshed', 'success')
+      })
+      .catch((error) => onToast?.(error instanceof Error ? error.message : String(error), 'error'))
+  }, [agentId, onToast])
 
   useEffect(() => {
     const loadBranch = () => {
@@ -96,135 +251,14 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
   }, [agentId])
 
   useEffect(() => {
-    if (models.length > 0) return
     if (info?.status !== 'idle' && info?.status !== 'working') return
+    // Refresh on every transition: an early fallback catalog (taken while the
+    // daemon was still starting) must not stay pinned for the app's lifetime.
     void window.prime.agentCommand(agentId, { type: 'get_available_models' }).then((res) => {
-      setModels(parseModelList(res))
+      const parsed = parseModelList(res)
+      if (parsed.length > 0) setModels(parsed)
     }).catch(() => {})
-  }, [agentId, info?.status, info?.model, models.length])
-
-  useEffect(() => {
-    const off = window.prime.onEvent((raw) => {
-      const e = raw as { agentId?: string; type?: string; payload?: Record<string, unknown> }
-      if (e.agentId !== agentId) return
-      const p = e.payload ?? {}
-      switch (e.type) {
-        case 'message_update': {
-          const msg = p.message as Record<string, unknown> | undefined
-          if (!msg) return
-          if (isInternalStateRestoreMessage(msg)) {
-            setMessages((prev) => prev.filter((message) => message.id !== msg.id))
-            break
-          }
-          const ev = p.assistantMessageEvent as Record<string, unknown> | undefined
-          if (ev?.type === 'text_delta' || ev?.type === 'thinking_delta' || ev?.type === 'toolcall_delta') {
-            setAwaitingResponse(false)
-          }
-          setMessages((prev) => {
-            const next = merge(prev, msg)
-            const idx = next.findIndex((m) => m.id === msg.id)
-            if (idx >= 0) {
-              next[idx] = {
-                ...next[idx],
-                streaming: ev?.type === 'text_delta' || ev?.type === 'thinking_delta' || ev?.type === 'toolcall_delta'
-              }
-            }
-            return next
-          })
-          break
-        }
-        case 'message_start':
-        case 'message_end': {
-          const msg = p.message as Record<string, unknown> | undefined
-          if (e.type === 'message_end' && msg?.role === 'assistant') setAwaitingResponse(false)
-          if (msg && isInternalStateRestoreMessage(msg)) {
-            setMessages((prev) => prev.filter((message) => message.id !== msg.id))
-          } else if (msg) {
-            setMessages((prev) => merge(prev, msg))
-          }
-          if (e.type === 'message_end' && msg?.role === 'toolResult') {
-            setToolExecs((prev) => patchToolExecs(prev, 'end', msg))
-          }
-          break
-        }
-        case 'custom_message': {
-          if (p.display === false) break
-          if (isInternalStateRestoreMessage(p)) break
-          if (p.customType === 'agent_message') {
-            setAwaitingResponse(false)
-            setMessages((prev) => merge(prev, { ...p, role: 'assistant' }))
-          } else if (
-            p.customType === 'session_slash_command' ||
-            p.customType === 'session_slash_command_result' ||
-            p.customType === 'compaction_outcome'
-          ) {
-            setMessages((prev) => merge(prev, {
-              id: `sys-${String(p.customType)}-${String(p.timestamp ?? Date.now())}`,
-              role: 'system',
-              content: String(p.content ?? '')
-            }))
-          }
-          break
-        }
-        case 'session_resumed':
-        case 'session_replaced':
-        case 'session_resynced': {
-          void window.prime.agentMessages(agentId).then((items) => {
-            setMessages(renderMessages(items))
-          })
-          break
-        }
-        case 'session_started': {
-          setMessages([])
-          setToolExecs({})
-          setAwaitingResponse(false)
-          break
-        }
-        case 'turn_end': {
-          setAwaitingResponse(false)
-          const msg = p.message as Record<string, unknown> | undefined
-          const results = p.toolResults as Record<string, unknown>[] | undefined
-          setMessages((prev) => {
-            let next = prev
-            if (msg && !isInternalStateRestoreMessage(msg)) next = merge(next, msg)
-            if (results) {
-              for (const r of results) {
-                next = merge(next, {
-                  id: `tr-${r.toolCallId}`,
-                  role: 'toolResult',
-                  toolCallId: r.toolCallId,
-                  content: r.content,
-                  isError: r.isError
-                })
-              }
-            }
-            return next.map((m) => ({ ...m, streaming: false }))
-          })
-          setToolExecs((prev) => finishToolExecs(prev, results))
-          break
-        }
-        case 'agent_end': {
-          setAwaitingResponse(false)
-          setToolExecs((prev) => finishToolExecs(prev))
-          setMessages((prev) => prev.map((m) => (m.streaming ? { ...m, streaming: false } : m)))
-          break
-        }
-        case 'tool_execution_start': {
-          setToolExecs((prev) => patchToolExecs(prev, 'start', p))
-          break
-        }
-        case 'tool_execution_update': {
-          setToolExecs((prev) => patchToolExecs(prev, 'update', p))
-          break
-        }
-        case 'tool_execution_end': {
-          setToolExecs((prev) => patchToolExecs(prev, 'end', p))
-          break
-        }
-      }
-    })
-    return off
-  }, [agentId])
+  }, [agentId, info?.status, info?.model, info?.sessionId])
 
   useEffect(() => {
     const el = scrollRef.current
@@ -262,38 +296,31 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
     }
   }, [messages])
 
-  const busy = info?.isStreaming === true || info?.status === 'working'
-
-  useEffect(() => {
-    if (busy) return
-    setAwaitingResponse(false)
-    setToolExecs((prev) => finishToolExecs(prev))
-    setMessages((prev) => {
-      if (!prev.some((m) => m.streaming)) return prev
-      return prev.map((m) => (m.streaming ? { ...m, streaming: false } : m))
-    })
-  }, [busy])
-
   const handleSend = useCallback(
     (text: string, images: { type: 'image'; data: string; mimeType: string }[]) => {
+      thread.markSent(busy)
       if (!busy) {
         followLatestRef.current = true
         setShowJumpToLatest(false)
-        setAwaitingResponse(true)
       }
       void window.prime.agentCommand(agentId, {
         type: 'prompt',
         message: text,
         images: images.length ? images : undefined,
-        streamingBehavior: busy ? 'steer' : undefined
+        streamingBehavior: busy ? 'steer' : 'followUp'
       } as never).catch((err) => {
-        setAwaitingResponse(false)
+        thread.clearAwaiting()
         console.error('send failed', err)
         onToast?.(err instanceof Error ? err.message : String(err), 'error')
       })
     },
-    [agentId, busy, onToast]
+    [agentId, busy, onToast, thread]
   )
+
+  const handleFollowUp = useCallback((text: string) => {
+    void window.prime.agentCommand(agentId, { type: 'follow_up', message: text } as never)
+      .catch((err) => onToast?.(err instanceof Error ? err.message : String(err), 'error'))
+  }, [agentId, onToast])
 
   const handleAbort = useCallback(
     () => void window.prime.agentCommand(agentId, { type: 'abort' } as never).catch(() => {}),
@@ -302,27 +329,44 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
 
   const handleBash = useCallback(
     (cmd: string) => {
-      void window.prime.agentCommand(agentId, { type: 'bash', command: cmd } as never).then(() => {
-        void window.prime.agentMessages(agentId).then((msgs) => {
-          setMessages(renderMessages(msgs))
-        })
-      }).catch((err) => console.error(err))
+      void window.prime.agentCommand(agentId, { type: 'bash', command: cmd } as never)
+        .then(() => thread.reload())
+        .catch((err) => console.error(err))
     },
-    [agentId]
+    [agentId, thread]
   )
 
   const pickModel = (name: string) => {
-    const slash = name.indexOf('/')
-    const provider = slash >= 0 ? name.slice(0, slash) : undefined
-    const id = slash >= 0 ? name.slice(slash + 1) : name
-    void window.prime.agentCommand(agentId, { type: 'set_model', provider, modelId: id } as never).catch(() => {})
+    let provider: string | undefined
+    let id: string
+    if (name.startsWith('openrouter/')) {
+      provider = 'openrouter'
+      id = name.slice('openrouter/'.length)
+      if (!id) return
+    } else {
+      const slash = name.indexOf('/')
+      provider = slash >= 0 ? name.slice(0, slash) : undefined
+      id = slash >= 0 ? name.slice(slash + 1) : name
+    }
+    void window.prime.agentCommand(agentId, { type: 'set_model', provider, modelId: id } as never)
+      .then((res) => {
+        if ((res as { queued?: boolean } | null)?.queued === true) return // busy toast already shown by main
+        onToast?.(`Model set to ${id}`, 'success')
+      })
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err)
+        onToast?.(message.replace(/^Model not found:\s*openrouter\//i, 'Model not found: '), 'error')
+      })
   }
 
   const sendQuickPrompt = (prompt: string) => {
     handleSend(prompt, [])
   }
 
-  const [effortLevel, setEffortLevel] = useState<string>('High')
+  const [effortLevel, setEffortLevel] = useState<string>(() => isThinkingLevel(info?.thinkingLevel) ? info.thinkingLevel : 'medium')
+  useEffect(() => {
+    if (isThinkingLevel(info?.thinkingLevel)) setEffortLevel(info.thinkingLevel)
+  }, [info?.thinkingLevel])
   const [overlay, setOverlay] = useState<{ id: SlashOverlayId; args: string } | null>(null)
   const [openPicker, setOpenPicker] = useState<'models' | 'effort' | 'depth' | null>(null)
   const [goal, setGoal] = useState<GoalState | null>(null)
@@ -341,22 +385,22 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
   }, [agentId])
 
   const note = useCallback((text: string) => {
-    setMessages((prev) => [...prev, { id: `cmd-${Date.now()}`, role: 'system', content: text }])
-  }, [])
+    thread.pushSystemNote(text)
+  }, [thread])
 
   const cmd = useCallback((payload: Record<string, unknown>) => {
     return window.prime.agentCommand(agentId, payload as never)
   }, [agentId])
 
-  const reloadMessages = useCallback(() => {
-    void window.prime.agentMessages(agentId).then((msgs) => {
-      setMessages(renderMessages(msgs))
-    })
-  }, [agentId])
+  const reloadMessages = thread.reload
 
   const handleSelectEffort = (effort: string) => {
+    const previous = effortLevel
     setEffortLevel(effort)
-    void cmd({ type: 'set_thinking_level', level: effort.toLowerCase() }).catch(() => {})
+    void cmd({ type: 'set_thinking_level', level: effort }).catch((error) => {
+      setEffortLevel(previous)
+      onToast?.(error instanceof Error ? error.message : String(error), 'error')
+    })
   }
 
   const handleSlash = useCallback(async (raw: string) => {
@@ -396,7 +440,6 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
           return
         case 'new-session':
           await cmd({ type: 'new_session' })
-          setMessages([])
           if (action.prompt) handleSend(action.prompt, [])
           else note('Started a new session')
           return
@@ -425,7 +468,6 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
         }
         case 'compact':
           await cmd({ type: 'compact', customInstructions: action.instructions })
-          note('Compacting context…')
           return
         case 'refine':
           await cmd({ type: 'refine', instructions: action.instructions, rollbackId: action.rollbackId, global: action.global })
@@ -507,8 +549,17 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
     }
   }, [agentId, cmd, handleSend, note, onDepthChange, onNavigate, onToast, reloadMessages])
 
+  useEffect(() => {
+    const onPaletteSlash = (event: Event) => {
+      const detail = (event as CustomEvent<string>).detail
+      if (typeof detail === 'string' && detail) void handleSlash(detail)
+    }
+    window.addEventListener('prime:palette-slash', onPaletteSlash)
+    return () => window.removeEventListener('prime:palette-slash', onPaletteSlash)
+  }, [handleSlash])
+
   return (
-    <div className="codex-chat-layout">
+    <div className="codex-chat-layout" ref={layoutRef}>
       {/* Main Messages Area */}
       <div className="codex-messages-area" ref={scrollRef} onScroll={handleMessagesScroll}>
         {messages.length === 0 && !awaitingResponse ? (
@@ -564,12 +615,45 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
           </div>
         ) : (
           <div className="codex-feed-wrapper">
-            {messages.map((m, i) => (
-              <MessageItem key={m.id ?? i} message={m} toolExecs={toolExecs} onOpenSubagent={onOpenSubagent} showReasoning={showReasoning} />
-            ))}
-            {awaitingResponse && (
-              <div className="assistant-pending" role="status" aria-live="polite">
-                <span className="assistant-pending-shimmer">Thinking…</span>
+            {messages.map((m, i) => {
+              const lastAssistantIndex = messages.reduce((last, item, index) => item.role === 'assistant' ? index : last, -1)
+              const mid = normalizeMessageId(m)
+              const work = m.role === 'assistant' ? workRows.get(m.id) : undefined
+              return (
+                <div key={m.id ?? i}>
+                  {work && (
+                    <WorkDurationRow
+                      startedAt={work.startedAt}
+                      durationMs={work.durationMs}
+                      active={work.active}
+                    />
+                  )}
+                  {i === pendingWorkIndex && (
+                    <WorkDurationRow startedAt={pendingStartedAt ?? undefined} active />
+                  )}
+                  <MessageItem
+                    message={m}
+                    toolExecs={toolExecs}
+                    onOpenSubagent={onOpenSubagent}
+                    showReasoning={showReasoning}
+                    artifacts={mid ? (artifactOwners.get(mid) ?? []) : []}
+                    onOpenArtifacts={onOpenArtifacts}
+                    isLast={i === lastAssistantIndex}
+                    turnComplete={!busy}
+                    fileEditsAtEnd={m.role === 'assistant' ? (deferredFileEdits.get(m.id) ?? []) : undefined}
+                  />
+                </div>
+              )
+            })}
+            {pendingWorkIndex >= messages.length && pendingWorkIndex >= 0 && (
+              <WorkDurationRow startedAt={pendingStartedAt ?? undefined} active />
+            )}
+            {thread.compacting && (
+              <div className="compaction-card compacting" role="status" aria-live="polite">
+                <svg className="compaction-spin" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 12a9 9 0 11-6.2-8.56" />
+                </svg>
+                <span><strong>Compacting context…</strong> — summarizing older history</span>
               </div>
             )}
           </div>
@@ -595,25 +679,19 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
       )}
 
       {/* Floating Bottom Composer */}
+      {info?.retry && (
+        <div className="retry-banner" role="status">
+          <span className="retry-banner-mark" aria-hidden="true" />
+          <span className="retry-banner-text">
+            Retrying · attempt {info.retry.attempt}{info.retry.maxAttempts ? ` of ${info.retry.maxAttempts}` : ''}
+            {info.retry.errorMessage ? ` — ${info.retry.errorMessage.slice(0, 140)}` : ''}
+          </span>
+          <button type="button" onClick={() => void cmd({ type: 'abort_retry' }).catch(() => {})}>
+            Stop retrying
+          </button>
+        </div>
+      )}
       <ExtensionSurface info={info} placement="aboveEditor" />
-      <HarnessTray
-        agentId={agentId}
-        busy={busy}
-        models={models}
-        currentModel={info?.model ?? undefined}
-        onSelectModel={pickModel}
-        commands={commands}
-        effortLevel={effortLevel}
-        onSelectEffort={handleSelectEffort}
-        accessMode={accessMode}
-        onAccessModeChange={onAccessModeChange}
-        rlmMaxDepth={rlmMaxDepth}
-        onDepthChange={onDepthChange}
-        showReasoning={showReasoning}
-        onSlash={(text) => void handleSlash(text)}
-        onBash={handleBash}
-        onToast={onToast}
-      />
       <Composer
         busy={busy}
         commands={commands}
@@ -621,13 +699,14 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
         onSlash={(text) => void handleSlash(text)}
         onAbort={handleAbort}
         onBash={handleBash}
+        onFollowUp={handleFollowUp}
         models={models}
         currentModel={info?.model ?? undefined}
         onSelectModel={pickModel}
+        onRefreshModels={refreshOpenRouterModels}
+        onToast={onToast}
         effortLevel={effortLevel}
         onSelectEffort={handleSelectEffort}
-        accessMode={accessMode}
-        onAccessModeChange={onAccessModeChange}
         rlmMaxDepth={rlmMaxDepth}
         onDepthChange={onDepthChange}
         openPicker={openPicker}
@@ -641,6 +720,31 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
         onBranchClick={onOpenGit}
         showContext={messages.length === 0}
         externalText={info?.extensionUi?.editorText}
+        header={<HarnessTray
+          agentId={agentId}
+          busy={busy}
+          contextPercent={info?.contextPercent ?? null}
+          models={models}
+          currentModel={info?.model ?? undefined}
+          onSelectModel={pickModel}
+          commands={commands}
+          effortLevel={effortLevel}
+          onSelectEffort={handleSelectEffort}
+          rlmMaxDepth={rlmMaxDepth}
+          onDepthChange={onDepthChange}
+          showReasoning={showReasoning}
+          onSlash={(text) => void handleSlash(text)}
+          onBash={handleBash}
+          onToast={onToast}
+          status={busy || awaitingResponse || thread.compacting || info?.retry ? <RunStatus
+            active
+            activity={thread.activity}
+            toolNames={runningToolNames}
+            compacting={thread.compacting}
+            retry={info?.retry}
+            startedAt={pendingStartedAt}
+          /> : null}
+        />}
         banner={goal?.objective && goal.status !== 'idle' ? (
           <button
             className={`goal-chip ${goal.status}`}
@@ -706,6 +810,46 @@ export default function ChatView({ agentId, info, tab: _tab, projects = [], acce
           }}
         />
       )}
+    </div>
+  )
+}
+
+export function RunStatus({ active, activity, toolNames, compacting, retry, startedAt }: {
+  active: boolean
+  activity: AgentActivity | null
+  toolNames: string[]
+  compacting: boolean
+  retry?: AgentInfo['retry']
+  startedAt: number | null
+}): JSX.Element | null {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!active) return
+    setNow(Date.now())
+    // Update this small row, not the full transcript. No extra daemon polling.
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [active])
+  if (!active) return null
+
+  const label = retry ? `Retrying model request · ${retry.attempt}${retry.maxAttempts ? ` of ${retry.maxAttempts}` : ''}`
+    : compacting ? 'Compacting context'
+    : toolNames.length > 0 ? `Running ${toolNames.slice(0, 2).join(', ')}${toolNames.length > 2 ? ` +${toolNames.length - 2}` : ''}`
+    : activity?.phase === 'reasoning' ? 'Receiving reasoning'
+    : activity?.phase === 'writing' ? 'Receiving response'
+    : activity?.phase === 'tools' ? 'Preparing tool call'
+    : activity ? 'Waiting for model'
+    : 'Agent is running · waiting for status'
+  const lastUpdate = activity?.updatedAt ?? startedAt
+  const quietFor = lastUpdate == null ? 0 : Math.max(0, now - lastUpdate)
+  return (
+    <div className="run-status">
+      <span className="run-status-dot" aria-hidden="true" />
+      <span className="run-status-label" role="status" aria-live="polite" title={label}>{label}</span>
+      {quietFor >= 15_000 && <span className="run-status-quiet"
+        title="The app has received no new activity. A model or tool can continue without sending updates.">
+        No update for {formatWorkDuration(quietFor)}
+      </span>}
     </div>
   )
 }

@@ -4,6 +4,7 @@ import type { ModelOption } from '@shared/models'
 import type { SlashOverlayId } from '@shared/slash'
 import { HOTKEYS } from '@shared/slash'
 import DepthSlider from './DepthSlider'
+import { THINKING_LEVELS, thinkingLabel } from '@shared/thinking'
 
 export interface ForkMessage {
   entryId: string
@@ -29,7 +30,6 @@ interface Props {
   onScopedModels: (models: ModelOption[]) => void
 }
 
-const EFFORTS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
 
 export default function SlashOverlay(props: Props): JSX.Element {
   return (
@@ -78,13 +78,13 @@ function OverlayBody(props: Props): JSX.Element {
       return (
         <SimplePane title="Effort" onClose={props.onClose}>
           <div className="slash-list">
-            {EFFORTS.map((level) => (
+            {THINKING_LEVELS.map((level) => (
               <button
                 key={level}
-                className={`slash-row ${level === props.effortLevel.toLowerCase() ? 'selected' : ''}`}
+                className={`slash-row ${level === props.effortLevel ? 'selected' : ''}`}
                 onClick={() => { props.onEffort(level); props.onClose() }}
               >
-                {level}
+                {thinkingLabel(level)}
               </button>
             ))}
           </div>

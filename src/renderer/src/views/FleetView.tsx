@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { AppState, FleetEntry } from '../lib/store'
-import type { ScheduleJob } from '@shared/types'
+import type { ExternalAgentInfo, ScheduleJob } from '@shared/types'
 
 interface Props {
   state: AppState
@@ -21,6 +21,18 @@ export default function FleetView({ state }: Props): JSX.Element {
   const [heartbeatPrompt, setHeartbeatPrompt] = useState('')
   const [heartbeatMode, setHeartbeatMode] = useState<'steer' | 'follow_up'>('steer')
   const [heartbeats, setHeartbeats] = useState<HeartbeatRow[]>([])
+  const [external, setExternal] = useState<ExternalAgentInfo[]>([])
+  const [externalMsgFor, setExternalMsgFor] = useState<string | null>(null)
+  const [externalMsg, setExternalMsg] = useState('')
+
+  useEffect(() => {
+    const loadExternal = () => {
+      void window.prime.externalList().then((list) => setExternal((list ?? []) as ExternalAgentInfo[])).catch(() => {})
+    }
+    loadExternal()
+    const timer = window.setInterval(loadExternal, 5000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   useEffect(() => {
     void window.prime.fleetSchedules().then((res) => {
@@ -71,8 +83,18 @@ export default function FleetView({ state }: Props): JSX.Element {
   return (
     <div className="view scheduled-page">
       <header className="view-header">
-        <h2>Automations</h2>
-        <p className="view-sub">Recurring work, heartbeats, and messages between running agents.</p>
+        <div className="view-heading">
+          <span className="view-chip chip-automations" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 7v5l3 2" />
+            </svg>
+          </span>
+          <div>
+            <h2>Automations</h2>
+            <p className="view-sub">Recurring work, heartbeats, and messages between running agents.</p>
+          </div>
+        </div>
       </header>
 
       <div className="fleet-grid">
@@ -197,6 +219,70 @@ export default function FleetView({ state }: Props): JSX.Element {
         ))}
         {agents.length === 0 && <div className="cmd-empty">No agents running. Open a project folder first.</div>}
       </div>
+
+      <section className="panel">
+        <div className="panel-head">Terminal agents</div>
+        {external.length === 0 && (
+          <div className="cmd-empty">No prime-agent sessions in your terminal right now. Start one with <code>prime-agent</code> — it appears here live.</div>
+        )}
+        {external.map((agent) => (
+          <div key={agent.activeSessionId} className="schedule-row external-row">
+            <span className={`tab-dot ${agent.status === 'working' ? 'working' : agent.status === 'error' ? 'error' : 'idle'}`} />
+            <div className="heartbeat-session">
+              <strong>{agent.name}</strong>
+              <span>
+                {agent.cwd ? `${agent.cwd.split('/').filter(Boolean).pop()} · ` : ''}
+                {agent.task || 'no messages yet'}
+              </span>
+            </div>
+            <span className={`badge-ok ${agent.status}`}>{agent.status}</span>
+            <div className="row-gap">
+              <button
+                className="btn ghost small"
+                disabled={!agents[0]}
+                title={agents[0] ? undefined : 'Open a project first'}
+                onClick={() => void window.prime.fleetObserve(agents[0].id, agent.activeSessionId)}
+              >
+                Watch
+              </button>
+              <button className="btn ghost small" onClick={() => setExternalMsgFor(externalMsgFor === agent.activeSessionId ? null : agent.activeSessionId)}>
+                Message
+              </button>
+            </div>
+            {externalMsgFor === agent.activeSessionId && (
+              <div className="schedule-form external-msg-form">
+                <input
+                  className="field grow"
+                  autoFocus
+                  placeholder="Message this agent (delivered via agent-to-agent messaging)"
+                  value={externalMsg}
+                  onChange={(e) => setExternalMsg(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && externalMsg.trim()) {
+                      void window.prime.externalMessage(agent.activeSessionId, externalMsg.trim()).then(() => {
+                        setExternalMsg('')
+                        setExternalMsgFor(null)
+                      })
+                    }
+                  }}
+                />
+                <button
+                  className="btn primary small"
+                  disabled={!externalMsg.trim()}
+                  onClick={() => {
+                    void window.prime.externalMessage(agent.activeSessionId, externalMsg.trim()).then(() => {
+                      setExternalMsg('')
+                      setExternalMsgFor(null)
+                    })
+                  }}
+                >
+                  Send
+                </button>
+              </div>
+            )}
+          </div>
+        ))}
+      </section>
 
       <section className="panel">
         <div className="panel-head">Send message between agents</div>

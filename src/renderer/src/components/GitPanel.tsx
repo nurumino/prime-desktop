@@ -43,7 +43,7 @@ interface Selection {
   staged: boolean
 }
 
-export default function GitPanel({ agentId }: { agentId: string | null }): JSX.Element {
+export default function GitPanel({ agentId, onToast }: { agentId: string | null; onToast?: (text: string, kind?: 'info' | 'success' | 'warning' | 'error') => void }): JSX.Element {
   const [status, setStatus] = useState<GitStatus>(EMPTY_STATUS)
   const [selection, setSelection] = useState<Selection | null>(null)
   const [diff, setDiff] = useState('')
@@ -52,6 +52,12 @@ export default function GitPanel({ agentId }: { agentId: string | null }): JSX.E
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
 
+  const reportError = useCallback((reason: unknown) => {
+    const text = reason instanceof Error ? reason.message : String(reason)
+    setError(text)
+    onToast?.(text, 'error')
+  }, [onToast])
+
   const refresh = useCallback(async () => {
     if (!agentId) return
     try {
@@ -59,11 +65,11 @@ export default function GitPanel({ agentId }: { agentId: string | null }): JSX.E
       setStatus(next)
       setError('')
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      reportError(reason)
     } finally {
       setLoading(false)
     }
-  }, [agentId])
+  }, [agentId, reportError])
 
   useEffect(() => {
     setLoading(true)
@@ -89,9 +95,9 @@ export default function GitPanel({ agentId }: { agentId: string | null }): JSX.E
     let active = true
     void window.prime.gitFileDiff(agentId, selection.path, selection.staged)
       .then((value: string) => { if (active) setDiff(value) })
-      .catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : String(reason)) })
+      .catch((reason: unknown) => { if (active) reportError(reason) })
     return () => { active = false }
-  }, [agentId, selection])
+  }, [agentId, selection, reportError])
 
   const run = async (action: () => Promise<unknown>, after?: () => void) => {
     setBusy(true)
@@ -101,7 +107,7 @@ export default function GitPanel({ agentId }: { agentId: string | null }): JSX.E
       setStatus(result)
       after?.()
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      reportError(reason)
     } finally {
       setBusy(false)
     }
@@ -118,7 +124,7 @@ export default function GitPanel({ agentId }: { agentId: string | null }): JSX.E
       setSelection(null)
       setDiff('')
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      reportError(reason)
     } finally {
       setBusy(false)
     }
@@ -186,7 +192,7 @@ export default function GitPanel({ agentId }: { agentId: string | null }): JSX.E
         )}
       </div>
 
-      {error && <div className="git-error" role="status">{error}</div>}
+      {error && <span className="sr-only" role="status">{error}</span>}
       <div className="git-commit">
         <textarea
           value={message}

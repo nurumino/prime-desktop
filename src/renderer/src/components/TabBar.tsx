@@ -5,6 +5,10 @@ interface Props {
   onToggleSidebar: () => void
   onNewChat: () => void
   onOpenProject: () => void
+  canGoBack: boolean
+  canGoForward: boolean
+  onBack: () => void
+  onForward: () => void
   projectName?: string
 }
 
@@ -15,6 +19,10 @@ export default function TabBar({
   onToggleSidebar,
   onNewChat,
   onOpenProject,
+  canGoBack,
+  canGoForward,
+  onBack,
+  onForward,
   projectName
 }: Props): JSX.Element {
   return (
@@ -24,10 +32,10 @@ export default function TabBar({
           <button className="topbar-nav-btn" onClick={onToggleSidebar} title="Open sidebar" aria-label="Open sidebar">
             <SidebarIcon />
           </button>
-          <button className="topbar-nav-btn" disabled title="Back" aria-label="Back">
+          <button className="topbar-nav-btn" disabled={!canGoBack} onClick={onBack} title="Back" aria-label="Back">
             <ChevronIcon direction="left" />
           </button>
-          <button className="topbar-nav-btn" disabled title="Forward" aria-label="Forward">
+          <button className="topbar-nav-btn" disabled={!canGoForward} onClick={onForward} title="Forward" aria-label="Forward">
             <ChevronIcon direction="right" />
           </button>
           <button className="topbar-nav-btn" onClick={onNewChat} title="New chat" aria-label="New chat">

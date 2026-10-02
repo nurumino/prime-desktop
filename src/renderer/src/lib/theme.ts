@@ -1,8 +1,8 @@
 import type { AppSettings, ThemeConfig } from '@shared/types'
 import { resolveThemeMode } from '@shared/themes'
 
-const UI_FALLBACK = '"SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif'
-const CODE_FALLBACK = 'ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Monaco, "Cascadia Mono", Consolas, monospace'
+const UI_FALLBACK = '"Geist", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif'
+const CODE_FALLBACK = '"Geist Mono", ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace'
 
 function hex(value: string, fallback: string): string {
   return /^#[0-9a-f]{6}$/i.test(value) ? value : fallback
@@ -33,7 +33,8 @@ export function applyAppTheme(settings: AppSettings, systemDark: boolean): void 
   const variant = resolveThemeMode(settings.themeMode, systemDark)
   const theme: ThemeConfig = variant === 'dark' ? settings.darkTheme : settings.lightTheme
   const surface = hex(theme.surface, variant === 'dark' ? '#00000e' : '#ffffff')
-  const ink = hex(theme.ink, variant === 'dark' ? '#ffffff' : '#5c5870')
+  const configuredInk = hex(theme.ink, variant === 'dark' ? '#ffffff' : '#292832')
+  const ink = variant === 'light' && configuredInk.toLowerCase() === '#5c5870' ? '#292832' : configuredInk
   const accent = hex(theme.accent, '#339cff')
   const contrast = Math.max(0, Math.min(100, theme.contrast)) / 100
   const root = document.documentElement
@@ -57,8 +58,8 @@ export function applyAppTheme(settings: AppSettings, systemDark: boolean): void 
     '--border-subtle': mix(surface, ink, 0.045 + contrast * 0.065),
     '--ink': ink,
     '--text': ink,
-    '--text-muted': mix(ink, surface, variant === 'dark' ? 0.38 : 0.34),
-    '--text-dim': mix(ink, surface, variant === 'dark' ? 0.56 : 0.58),
+    '--text-muted': mix(ink, surface, variant === 'dark' ? 0.38 : 0.28),
+    '--text-dim': mix(ink, surface, variant === 'dark' ? 0.56 : 0.46),
     '--ink-dim': mix(ink, surface, 0.38),
     '--accent': accent,
     '--accent-hover': mix(accent, variant === 'dark' ? '#ffffff' : '#000000', 0.14),

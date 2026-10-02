@@ -43,6 +43,12 @@ const api = {
     return () => ipcRenderer.removeListener(IPC.terminalExit, listener)
   },
   fleetObserve: (agentId: string, sessionId: string) => ipcRenderer.invoke(IPC.fleetObserve, agentId, sessionId),
+  externalList: () => ipcRenderer.invoke(IPC.externalList),
+  externalMessage: (target: string, message: string) => ipcRenderer.invoke(IPC.externalMessage, target, message),
+  modelsCustomGet: () => ipcRenderer.invoke(IPC.modelsCustomGet),
+  modelsCustomSet: (config: unknown) => ipcRenderer.invoke(IPC.modelsCustomSet, config),
+  modelsCustomRemove: (providerId: string) => ipcRenderer.invoke(IPC.modelsCustomRemove, providerId),
+  modelsOpenRouterRefresh: (agentId: string) => ipcRenderer.invoke(IPC.modelsOpenRouterRefresh, agentId),
   fleetTree: (agentId: string) => ipcRenderer.invoke(IPC.fleetTree, agentId),
   fleetMessages: (agentId: string, activeSessionId: string) =>
     ipcRenderer.invoke(IPC.fleetMessages, agentId, activeSessionId),
@@ -61,15 +67,15 @@ const api = {
   gitStatus: (agentId: string) => ipcRenderer.invoke(IPC.gitStatus, agentId),
   gitFileDiff: (agentId: string, path: string, staged: boolean) =>
     ipcRenderer.invoke(IPC.gitFileDiff, agentId, path, staged),
+  artifactChoose: () => ipcRenderer.invoke(IPC.artifactChoose),
+  artifactRead: (agentId: string, path: string) => ipcRenderer.invoke(IPC.artifactRead, agentId, path),
+  artifactReadFile: (path: string) => ipcRenderer.invoke(IPC.artifactReadFile, path),
+  artifactReveal: (agentId: string, path: string) => ipcRenderer.invoke(IPC.artifactReveal, agentId, path),
   gitStage: (agentId: string, paths: string[]) => ipcRenderer.invoke(IPC.gitStage, agentId, paths),
   gitUnstage: (agentId: string, paths: string[]) => ipcRenderer.invoke(IPC.gitUnstage, agentId, paths),
   gitStageAll: (agentId: string) => ipcRenderer.invoke(IPC.gitStageAll, agentId),
   gitUnstageAll: (agentId: string) => ipcRenderer.invoke(IPC.gitUnstageAll, agentId),
   gitCommit: (agentId: string, message: string) => ipcRenderer.invoke(IPC.gitCommit, agentId, message),
-  permissionsList: () => ipcRenderer.invoke(IPC.permissionsList),
-  permissionsSet: (pattern: string, action: 'allow' | 'deny', scope: 'global' | 'project', projectPath?: string) =>
-    ipcRenderer.invoke(IPC.permissionsSet, pattern, action, scope, projectPath),
-  permissionsRemove: (index: number) => ipcRenderer.invoke(IPC.permissionsRemove, index),
   dashboardSpend: () => ipcRenderer.invoke(IPC.dashboardSpend),
   dashboardModels: () => ipcRenderer.invoke(IPC.dashboardModels),
   autonomyGet: () => ipcRenderer.invoke(IPC.autonomyGet),

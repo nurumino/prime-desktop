@@ -1,14 +1,16 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import type { CSSProperties } from 'react'
 import { extractText, mergeMessage, type FleetEntry, type RenderMessage } from '../lib/store'
-import type { SessionTreeNode, SubagentNode } from '@shared/types'
+import type { Artifact, SessionTreeNode, SubagentNode } from '@shared/types'
 import { isInternalStateRestoreMessage } from '@shared/messageVisibility'
 import SubagentMark from './SubagentMark'
 import MessageItem from './MessageItem'
+import WorkingMark from './WorkingMark'
 import TerminalPanel from './TerminalPanel'
 import GitPanel from './GitPanel'
+const FilesPanel = lazy(() => import('./FilesPanel'))
 
-export type SidePanelTab = 'subagents' | 'sidechat' | 'timeline' | 'terminal' | 'git'
+export type SidePanelTab = 'subagents' | 'sidechat' | 'timeline' | 'terminal' | 'git' | 'files'
 
 interface Props {
   open: boolean
@@ -16,11 +18,16 @@ interface Props {
   fleet: FleetEntry[]
   tree: SubagentNode[]
   agentId: string | null
+  sessionId?: string | null
   activeTab?: SidePanelTab
   onTabChange?: (tab: SidePanelTab) => void
   selectedEntry: FleetEntry | null
   onSelectEntry: (entry: FleetEntry | null) => void
   showReasoning?: boolean
+  artifacts?: Artifact[]
+  onToast?: (text: string, kind?: 'info' | 'success' | 'warning' | 'error') => void
+  filesPreviewPath?: string | null
+  onFilesPreviewPathChange?: (path: string | null) => void
 }
 
 /* ─── Tab icons ──────────────────────────────────────── */
@@ -48,6 +55,15 @@ function GitIcon(): JSX.Element {
     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.8">
       <circle cx="18" cy="18" r="3" /><circle cx="6" cy="6" r="3" /><circle cx="6" cy="18" r="3" />
       <path d="M6 9v6M15.43 8.57l-8.86 8.86" />
+    </svg>
+  )
+}
+
+function FilesIcon(): JSX.Element {
+  return (
+    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M4 5.5A1.5 1.5 0 015.5 4h5l2 2h6A1.5 1.5 0 0120 7.5v10A1.5 1.5 0 0118.5 19h-13A1.5 1.5 0 014 17.5z" />
+      <path d="M4 9h16" />
     </svg>
   )
 }
@@ -469,12 +485,13 @@ function SubagentChat({
               toolExecs={{}}
               onOpenSubagent={onSelect}
               showReasoning={showReasoning}
+              turnComplete={entry.status !== 'running'}
             />
           ))}
           {conversationMessages.length === 0 && entry.status === 'running' && <div className="sp-chat-state"><span className="sp-stream-dot" /> Working</div>}
           {awaitingReply && (
             <div className="assistant-pending sp-assistant-pending" role="status">
-              <span className="assistant-pending-shimmer">Thinking…</span>
+              <WorkingMark />
             </div>
           )}
           {error && <div className="sp-chat-error">{error}</div>}
@@ -531,12 +548,15 @@ const TABS: { id: SidePanelTab; label: string; Icon: () => JSX.Element }[] = [
   { id: 'timeline', label: 'Timeline', Icon: TimelineIcon },
   { id: 'terminal', label: 'Terminal', Icon: TerminalIcon2 },
   { id: 'git', label: 'Git', Icon: GitIcon },
+  { id: 'files', label: 'Files', Icon: FilesIcon },
 ]
 
-export default function SidePanel({ open, onToggle, fleet, tree, agentId, activeTab = 'subagents', onTabChange, selectedEntry, onSelectEntry, showReasoning = true }: Props): JSX.Element {
+export default function SidePanel({ open, onToggle, fleet, tree, agentId, sessionId = null, activeTab = 'subagents', onTabChange, selectedEntry, onSelectEntry, showReasoning = true, artifacts = [], onToast, filesPreviewPath = null, onFilesPreviewPathChange }: Props): JSX.Element {
   const [tab, setTab] = useState<SidePanelTab>(activeTab)
-  const [width, setWidth] = useState(() => Math.max(360, Math.min(520, window.innerWidth - 232 - 360)))
+  const [width, setWidth] = useState(360)
   const dragging = useRef(false)
+  const userSized = useRef(false)
+  const panelRef = useRef<HTMLElement>(null)
 
   useEffect(() => { if (activeTab) setTab(activeTab) }, [activeTab])
 
@@ -545,10 +565,24 @@ export default function SidePanel({ open, onToggle, fleet, tree, agentId, active
     onTabChange?.(t)
   }
 
+  const fitToWorkspace = useCallback(() => {
+    const workspace = panelRef.current?.parentElement?.clientWidth ?? (window.innerWidth - 244)
+    setWidth(Math.max(360, Math.floor(workspace / 2)))
+  }, [])
+
+  useLayoutEffect(() => {
+    if (!open) {
+      userSized.current = false
+      return
+    }
+    if (!userSized.current) fitToWorkspace()
+  }, [open, fitToWorkspace])
+
   useEffect(() => {
     const move = (event: MouseEvent) => {
       if (!dragging.current) return
-      const maxWidth = Math.max(360, Math.min(760, window.innerWidth - 232 - 360))
+      const workspace = panelRef.current?.parentElement?.clientWidth ?? (window.innerWidth - 244)
+      const maxWidth = Math.max(360, workspace - 360)
       setWidth(Math.max(360, Math.min(maxWidth, window.innerWidth - event.clientX)))
     }
     const stop = () => {
@@ -565,25 +599,31 @@ export default function SidePanel({ open, onToggle, fleet, tree, agentId, active
   }, [])
 
   useEffect(() => {
-    const clampWidth = () => {
-      const maxWidth = Math.max(360, Math.min(760, window.innerWidth - 232 - 360))
+    const resize = () => {
+      if (!userSized.current) {
+        fitToWorkspace()
+        return
+      }
+      const workspace = panelRef.current?.parentElement?.clientWidth ?? (window.innerWidth - 244)
+      const maxWidth = Math.max(360, workspace - 360)
       setWidth((current) => Math.min(current, maxWidth))
     }
-    window.addEventListener('resize', clampWidth)
-    clampWidth()
-    return () => window.removeEventListener('resize', clampWidth)
-  }, [])
+    window.addEventListener('resize', resize)
+    resize()
+    return () => window.removeEventListener('resize', resize)
+  }, [fitToWorkspace])
 
   const selectedPath = selectedEntry ? findNodePath(tree, selectedEntry) : null
 
   return (
-    <aside className={`side-panel ${open ? 'open' : 'closed'}`} style={open ? { width } : undefined}>
+    <aside ref={panelRef} className={`side-panel ${open ? 'open' : 'closed'}`} style={open ? { width } : undefined}>
       {open && (
         <>
           <div
             className="sp-resize-handle"
             onMouseDown={() => {
               dragging.current = true
+              userSized.current = true
               document.body.classList.add('resizing-panel')
             }}
           />
@@ -627,6 +667,7 @@ export default function SidePanel({ open, onToggle, fleet, tree, agentId, active
                   {id === 'subagents' && (tree.length > 0 || fleet.length > 0) && (
                     <span className="sp-tab-badge">{Math.min(99, tree.length > 0 ? flattenTree(tree).length : fleet.length)}</span>
                   )}
+                  {id === 'files' && artifacts.length > 0 && <span className="sp-tab-badge">{Math.min(99, artifacts.length)}</span>}
                 </button>
               ))}
             <div className="sp-tabbar-fill" />
@@ -638,8 +679,14 @@ export default function SidePanel({ open, onToggle, fleet, tree, agentId, active
             {tab === 'subagents' && <SubagentsTab fleet={fleet} tree={tree} selected={selectedEntry} agentId={agentId} onSelect={onSelectEntry} showReasoning={showReasoning} />}
             <div id="side-thread-panel-slot" className={`side-thread-slot ${tab === 'sidechat' ? 'active' : ''}`} />
             {tab === 'timeline' && <TimelineTab agentId={agentId} />}
-            {tab === 'terminal' && <TerminalPanel agentId={agentId} />}
-            {tab === 'git' && <GitPanel agentId={agentId} />}
+            {/* One shell per project, shared by every chat in it. */}
+            {tab === 'terminal' && <TerminalPanel agentId={projectAgentId(agentId)} onToast={onToast} />}
+            {tab === 'git' && <GitPanel agentId={agentId} onToast={onToast} />}
+            {tab === 'files' && (
+              <Suspense fallback={<div className="artifact-loading" role="status">Loading files…</div>}>
+                <FilesPanel agentId={agentId} sessionId={sessionId} artifacts={artifacts} onToast={onToast} previewPath={filesPreviewPath} onPreviewPathChange={onFilesPreviewPathChange} />
+              </Suspense>
+            )}
           </div>
         </>
       )}
@@ -663,6 +710,15 @@ function TimelineTab({ agentId }: { agentId: string | null }): JSX.Element {
       })
       .finally(() => setLoading(false))
   }, [agentId])
+
+  // window.prompt does nothing in Electron, so labels are edited inline.
+  const [labeling, setLabeling] = useState<{ id: string; text: string } | null>(null)
+  const saveLabel = () => {
+    if (!labeling || !agentId) return
+    const { id, text } = labeling
+    setLabeling(null)
+    void window.prime.agentHarness(agentId, 'label_tree', { entryId: id, label: text.trim() || undefined }).then(load).catch(() => load())
+  }
 
   useEffect(() => {
     setTree([])
@@ -701,7 +757,21 @@ function TimelineTab({ agentId }: { agentId: string | null }): JSX.Element {
             <div className="timeline-copy">
               <div>
                 <span className="timeline-kind">{node.entry.type.replaceAll('_', ' ')}</span>
-                {node.label && <span className="timeline-label">{node.label}</span>}
+                {labeling?.id === node.entry.id ? (
+                  <input
+                    className="timeline-label-input"
+                    autoFocus
+                    value={labeling.text}
+                    placeholder="Label"
+                    aria-label="Entry label"
+                    onChange={(event) => setLabeling({ id: node.entry.id, text: event.target.value })}
+                    onBlur={saveLabel}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' && !event.nativeEvent.isComposing) saveLabel()
+                      if (event.key === 'Escape') setLabeling(null)
+                    }}
+                  />
+                ) : node.label && <span className="timeline-label">{node.label}</span>}
                 {current && <span className="timeline-current">current</span>}
               </div>
               {text && <span className="timeline-text">{text}</span>}
@@ -709,12 +779,7 @@ function TimelineTab({ agentId }: { agentId: string | null }): JSX.Element {
             <div className="timeline-actions">
               <button
                 type="button"
-                onClick={() => {
-                  const label = window.prompt('Entry label', node.label ?? '')
-                  if (label !== null) {
-                    void window.prime.agentHarness(agentId, 'label_tree', { entryId: node.entry.id, label: label.trim() || undefined }).then(load)
-                  }
-                }}
+                onClick={() => setLabeling({ id: node.entry.id, text: node.label ?? '' })}
               >
                 Label
               </button>
@@ -750,4 +815,9 @@ function sessionEntryText(node: SessionTreeNode): string {
   }
   const candidate = entry.summary ?? entry.name ?? entry.customType
   return typeof candidate === 'string' ? candidate.slice(0, 180) : ''
+}
+
+function projectAgentId(agentId: string | null): string | null {
+  // Parallel chat slots are named `agent-<tab>--<slot>`.
+  return agentId ? agentId.replace(/--[^-]+$/, '') : null
 }

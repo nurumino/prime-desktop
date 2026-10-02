@@ -1,6 +1,6 @@
 import { readFile, writeFile, mkdir, rename } from 'fs/promises'
 import { homedir } from 'os'
-import { join } from 'path'
+import { isAbsolute, join, resolve } from 'path'
 import { existsSync } from 'fs'
 import type { AppSettings, ProjectTab } from '@shared/types'
 import { CODEX_DARK_THEME, PRIME_LIGHT_THEME } from '@shared/themes'
@@ -12,7 +12,12 @@ export interface StoredState {
   activeTabId: string | null
   model: string | null
   pinnedSessionFiles: string[]
+  // Files the user picked through the preview "open file" dialog; the only
+  // out-of-project files the renderer may read or reveal.
+  previewFiles: string[]
 }
+
+const PREVIEW_FILES_LIMIT = 50
 
 const STATE_FILE = join(homedir(), 'Library', 'Application Support', 'PrimeDesktop', 'state.json')
 const STATE_VERSION = 2
@@ -53,19 +58,23 @@ async function load(): Promise<StoredState> {
       const raw = JSON.parse(await readFile(STATE_FILE, 'utf8')) as Partial<StoredState>
       cache = migrateState(raw)
     } else {
-      cache = { version: STATE_VERSION, settings: cloneDefaults(), tabs: [], activeTabId: null, model: null, pinnedSessionFiles: [] }
+      cache = emptyState()
     }
   } catch {
-    cache = { version: STATE_VERSION, settings: cloneDefaults(), tabs: [], activeTabId: null, model: null, pinnedSessionFiles: [] }
+    cache = emptyState()
   }
   return cache
+}
+
+function emptyState(): StoredState {
+  return { version: STATE_VERSION, settings: cloneDefaults(), tabs: [], activeTabId: null, model: null, pinnedSessionFiles: [], previewFiles: [] }
 }
 
 function cloneDefaults(): AppSettings {
   return structuredClone(DEFAULTS)
 }
 
-function migrateState(raw: Partial<StoredState>): StoredState {
+export function migrateState(raw: Partial<StoredState>): StoredState {
   const rawSettings = raw.settings && typeof raw.settings === 'object' ? raw.settings as Partial<AppSettings> : {}
   const autonomous = rawSettings.autonomous && typeof rawSettings.autonomous === 'object' && !Array.isArray(rawSettings.autonomous)
     ? rawSettings.autonomous as Partial<AppSettings['autonomous']>
@@ -95,6 +104,10 @@ function migrateState(raw: Partial<StoredState>): StoredState {
     model: typeof raw.model === 'string' ? raw.model : null,
     pinnedSessionFiles: Array.isArray(raw.pinnedSessionFiles)
       ? raw.pinnedSessionFiles.filter((path): path is string => typeof path === 'string')
+      : [],
+    previewFiles: Array.isArray(raw.previewFiles)
+      ? [...new Set(raw.previewFiles.filter((path): path is string =>
+        typeof path === 'string' && path.length > 0 && path.length <= 4_096 && isAbsolute(path)))].slice(0, PREVIEW_FILES_LIMIT)
       : []
   }
 }
@@ -161,4 +174,12 @@ export async function setSessionPinned(sessionFile: string, pinned: boolean): Pr
   s.pinnedSessionFiles = [...next]
   await save()
   return s.pinnedSessionFiles
+}
+
+export async function addPreviewFile(file: string): Promise<string[]> {
+  const s = await load()
+  const path = resolve(file)
+  s.previewFiles = [path, ...s.previewFiles.filter((item) => item !== path)].slice(0, PREVIEW_FILES_LIMIT)
+  await save()
+  return s.previewFiles
 }

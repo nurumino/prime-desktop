@@ -3,8 +3,8 @@ import type { ThemeConfig, ThemeMode } from './types'
 export const PRIME_LIGHT_THEME: ThemeConfig = {
   accent: '#c97b76',
   contrast: 42,
-  fonts: { code: null, ui: null },
-  ink: '#5c5870',
+  fonts: { code: 'Geist Mono', ui: 'Geist' },
+  ink: '#292832',
   opaqueWindows: true,
   semanticColors: {
     diffAdded: '#2da44e',
@@ -17,7 +17,7 @@ export const PRIME_LIGHT_THEME: ThemeConfig = {
 export const CODEX_DARK_THEME: ThemeConfig = {
   accent: '#339cff',
   contrast: 60,
-  fonts: { code: null, ui: null },
+  fonts: { code: 'Geist Mono', ui: 'Geist' },
   ink: '#ffffff',
   opaqueWindows: false,
   semanticColors: {

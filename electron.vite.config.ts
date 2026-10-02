@@ -20,7 +20,13 @@ export default defineConfig({
     }
   },
   renderer: {
-    plugins: [react()],
+    // Production pages allow no inline script. The dev server alone needs it
+    // for React Fast Refresh's inline preamble.
+    plugins: [react(), {
+      name: 'dev-csp-inline-preamble',
+      apply: 'serve',
+      transformIndexHtml: (html: string) => html.replace("script-src 'self';", "script-src 'self' 'unsafe-inline';")
+    }],
     resolve: {
       alias: {
         '@shared': resolve(__dirname, 'src/shared'),

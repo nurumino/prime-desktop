@@ -16,6 +16,8 @@ export interface BinaryState {
 
 export interface AgentInfo {
   id: string
+  /** Project tab this chat belongs to. A project can run several chats at once. */
+  tabId?: string
   name: string
   path: string
   status: 'starting' | 'idle' | 'working' | 'error' | 'stopped'
@@ -31,6 +33,7 @@ export interface AgentInfo {
   isStreaming: boolean
   sessionName: string | null
   sessionId: string | null
+  retry?: { attempt: number; maxAttempts: number; errorMessage?: string } | null
   version?: string
   extensionUi?: {
     title?: string
@@ -50,6 +53,17 @@ export interface FleetAgent {
   observed: boolean
   lastEvent: string
   children: FleetAgent[]
+}
+
+export interface ExternalAgentInfo {
+  activeSessionId: string
+  sessionId: string
+  name: string
+  task: string
+  cwd: string
+  status: 'working' | 'idle' | 'error' | 'archived'
+  isStreaming: boolean
+  lastActivityAt: number
 }
 
 export interface SubagentNode {
@@ -116,6 +130,15 @@ export interface FileDiff {
   diff: string
 }
 
+export interface Artifact {
+  path: string
+  status: FileDiff['status']
+  kind: 'structure' | 'image' | 'table' | 'document' | 'text' | 'unknown'
+  diff: string
+  source?: 'run' | 'uploaded'
+  messageId?: string
+}
+
 export interface GitChange {
   path: string
   originalPath?: string
@@ -139,13 +162,6 @@ export interface TerminalDataEvent {
   data: string
   startOffset: number
   endOffset: number
-}
-
-export interface PermissionRule {
-  pattern: string
-  action: 'allow' | 'deny'
-  scope: 'global' | 'project'
-  projectPath?: string
 }
 
 export interface SessionSummary {
@@ -226,6 +242,7 @@ export interface ActionQueue {
   steering: string[]
   followUp: string[]
   mutationSupported?: boolean
+  sendQueuedSupported?: boolean
 }
 
 export interface SideQuestionTurn {
@@ -392,6 +409,12 @@ export const IPC = {
   fleetScheduleCancel: 'fleet:schedule-cancel',
   fleetHeartbeat: 'fleet:heartbeat',
   fleetHeartbeatAction: 'fleet:heartbeat-action',
+  externalList: 'external:list',
+  externalMessage: 'external:message',
+  modelsCustomGet: 'models:custom-get',
+  modelsCustomSet: 'models:custom-set',
+  modelsCustomRemove: 'models:custom-remove',
+  modelsOpenRouterRefresh: 'models:openrouter-refresh',
   gitCheckpoint: 'git:checkpoint',
   gitList: 'git:list',
   gitRestore: 'git:restore',
@@ -399,6 +422,10 @@ export const IPC = {
   gitDiffFiles: 'git:diff-files',
   gitStatus: 'git:status',
   gitFileDiff: 'git:file-diff',
+  artifactChoose: 'artifact:choose',
+  artifactRead: 'artifact:read',
+  artifactReadFile: 'artifact:read-file',
+  artifactReveal: 'artifact:reveal',
   gitStage: 'git:stage',
   gitUnstage: 'git:unstage',
   gitStageAll: 'git:stage-all',
@@ -412,10 +439,6 @@ export const IPC = {
   terminalClose: 'terminal:close',
   terminalData: 'terminal:data',
   terminalExit: 'terminal:exit',
-  permissionsList: 'permissions:list',
-  permissionsSet: 'permissions:set',
-  permissionsRemove: 'permissions:remove',
-  permissionsMatch: 'permissions:match',
   dashboardSpend: 'dashboard:spend',
   dashboardModels: 'dashboard:models',
   autonomyGet: 'autonomy:get',

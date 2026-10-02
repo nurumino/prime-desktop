@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { initialState, mergeMessage, finishToolExecs, patchToolExecs, type AppState, type FleetEntry, type RenderMessage } from './lib/store'
+import { initialState, type AppState, type FleetEntry } from './lib/store'
 import TabBar from './components/TabBar'
 import Sidebar from './components/Sidebar'
 import SidePanel, { type SidePanelTab } from './components/SidePanel'
@@ -13,9 +13,53 @@ import DiagnosticsView from './views/DiagnosticsView'
 import Toasts from './components/Toasts'
 import DialogHost from './components/DialogHost'
 import WelcomeScreen from './components/WelcomeScreen'
-import type { PrimeEvent, SubagentNode, Toast } from '@shared/types'
-import type { AccessMode } from './components/AccessPicker'
+import CommandPalette from './components/CommandPalette'
+import type { PaletteItem } from '@shared/palette'
+import type { Artifact, FileDiff, PrimeEvent, SubagentNode, Toast } from '@shared/types'
+import ErrorBoundary from './components/ErrorBoundary'
 import { applyAppTheme } from './lib/theme'
+
+type NavigationLocation = { view: AppState['view']; tabId: string | null }
+
+function artifactKind(path: string): Artifact['kind'] {
+  const ext = path.toLowerCase().split('.').pop() ?? ''
+  if (['pdb', 'pdbqt', 'cif', 'mmcif', 'sdf', 'mol', 'mol2', 'xyz'].includes(ext)) return 'structure'
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) return 'image'
+  if (['csv', 'tsv', 'json', 'jsonl', 'xlsx', 'xls'].includes(ext)) return 'table'
+  if (['md', 'txt', 'log', 'html', 'xml', 'yaml', 'yml', 'toml', 'pdf', 'docx', 'pptx'].includes(ext)) return 'document'
+  if (['fasta', 'fa', 'fastq', 'fq', 'bed', 'gff', 'gtf', 'vcf'].includes(ext)) return 'text'
+  return 'unknown'
+}
+
+function messageIdOf(message: Record<string, unknown> | undefined): string | undefined {
+  if (!message) return undefined
+  const id = message.id as string | undefined
+  if (id) return id
+  if (message.timestamp == null) return undefined
+  return `m-${String(message.timestamp)}-${String(message.role ?? '')}`
+}
+
+function errorMessage(message: Record<string, unknown>): string {
+  const content = message.content
+  if (typeof content === 'string' && content.trim()) return content.trim()
+  if (Array.isArray(content)) {
+    const text = content.map((block) => {
+      if (!block || typeof block !== 'object') return ''
+      return String((block as Record<string, unknown>).text ?? (block as Record<string, unknown>).content ?? '')
+    }).join(' ').trim()
+    if (text) return text
+  }
+  return 'The agent could not complete that request.'
+}
+
+function cleanToastText(text: string): string {
+  const cleaned = text
+    .replace(/^Error invoking remote method ['"][^'"]+['"]:\s*/i, '')
+    .replace(/^Error:\s*/i, '')
+    .trim()
+  if (/agent not connected/i.test(cleaned)) return 'Agent not connected'
+  return cleaned || 'Something went wrong.'
+}
 
 export default function App(): JSX.Element {
   const [state, setState] = useState<AppState>(initialState)
@@ -24,10 +68,72 @@ export default function App(): JSX.Element {
 
   const [sidePanelOpen, setSidePanelOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [sidebarHoverOpen, setSidebarHoverOpen] = useState(false)
   const [sidePanelTab, setSidePanelTab] = useState<SidePanelTab>('subagents')
+  const [filesPreviewPath, setFilesPreviewPath] = useState<string | null>(null)
   const [selectedFleetEntry, setSelectedFleetEntry] = useState<FleetEntry | null>(null)
   const [subagentTree, setSubagentTree] = useState<SubagentNode[]>([])
-  const [accessMode, setAccessMode] = useState<AccessMode>('ask')
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const artifactBaselineRef = useRef<Record<string, Record<string, string>>>({})
+  const backHistoryRef = useRef<NavigationLocation[]>([])
+  const forwardHistoryRef = useRef<NavigationLocation[]>([])
+  const recentToastRef = useRef<{ text: string; at: number } | null>(null)
+  const [, setNavigationRevision] = useState(0)
+
+  const mutate = useCallback((fn: (s: AppState) => AppState) => {
+    setState((prev) => fn(prev))
+  }, [])
+
+  const showToast = useCallback((text: string, kind: Toast['kind'] = 'info') => {
+    const cleanText = cleanToastText(text)
+    const now = Date.now()
+    if (recentToastRef.current?.text === cleanText && now - recentToastRef.current.at < 2500) return
+    recentToastRef.current = { text: cleanText, at: now }
+    const t = { id: `t-${now}-${Math.random().toString(36).slice(2, 6)}`, kind, text: cleanText }
+    mutate((s) => ({ ...s, toasts: [...s.toasts.slice(-4), t] }))
+    window.setTimeout(() => {
+      mutate((s) => ({ ...s, toasts: s.toasts.filter((x) => x.id !== t.id) }))
+    }, 4000)
+  }, [mutate])
+
+  const currentLocation = useCallback((): NavigationLocation => ({
+    view: stateRef.current.view,
+    tabId: stateRef.current.activeTabId
+  }), [])
+
+  const applyLocation = useCallback((location: NavigationLocation) => {
+    // Keep the ref current immediately: callers such as the sidebar select a
+    // tab and then a view in the same tick, before React re-renders.
+    stateRef.current = { ...stateRef.current, view: location.view, activeTabId: location.tabId }
+    mutate((s) => ({ ...s, view: location.view, activeTabId: location.tabId }))
+    if (location.tabId) void window.prime.tabSelect(location.tabId)
+  }, [mutate])
+
+  const navigate = useCallback((view: AppState['view'], tabId = stateRef.current.activeTabId) => {
+    const current = currentLocation()
+    if (current.view === view && current.tabId === tabId) return
+    backHistoryRef.current.push(current)
+    if (backHistoryRef.current.length > 50) backHistoryRef.current.shift()
+    forwardHistoryRef.current = []
+    applyLocation({ view, tabId })
+    setNavigationRevision((revision) => revision + 1)
+  }, [applyLocation, currentLocation])
+
+  const goBack = useCallback(() => {
+    const location = backHistoryRef.current.pop()
+    if (!location) return
+    forwardHistoryRef.current.push(currentLocation())
+    applyLocation(location)
+    setNavigationRevision((revision) => revision + 1)
+  }, [applyLocation, currentLocation])
+
+  const goForward = useCallback(() => {
+    const location = forwardHistoryRef.current.pop()
+    if (!location) return
+    backHistoryRef.current.push(currentLocation())
+    applyLocation(location)
+    setNavigationRevision((revision) => revision + 1)
+  }, [applyLocation, currentLocation])
 
   useEffect(() => {
     const openSideChat = () => {
@@ -39,6 +145,17 @@ export default function App(): JSX.Element {
   }, [])
 
   useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        setPaletteOpen((open) => !open)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
     const apply = () => applyAppTheme(state.settings, media.matches)
     apply()
@@ -46,9 +163,28 @@ export default function App(): JSX.Element {
     return () => media.removeEventListener('change', apply)
   }, [state.settings])
 
-  const mutate = useCallback((fn: (s: AppState) => AppState) => {
-    setState((prev) => fn(prev))
-  }, [])
+  const refreshArtifacts = useCallback((agentId: string, messageId?: string) => {
+    void window.prime.gitDiffFiles(agentId).then((rawDiffs) => {
+      const diffs = rawDiffs as FileDiff[]
+      const baseline = artifactBaselineRef.current[agentId] ?? {}
+      const changed = diffs.filter((diff) => baseline[diff.path] !== diff.diff)
+      const sessionKey = `${agentId}::${stateRef.current.agents[agentId]?.sessionId ?? ''}`
+      const next = changed.map((diff) => ({
+        path: diff.path,
+        status: diff.status,
+        kind: artifactKind(diff.path),
+        diff: diff.diff,
+        messageId
+      }))
+      mutate((s) => {
+        const merged = new Map<string, Artifact>()
+        for (const existing of s.artifacts[sessionKey] ?? []) merged.set(`${existing.messageId ?? ''}::${existing.path}`, existing)
+        for (const artifact of next) merged.set(`${messageId ?? ''}::${artifact.path}`, artifact)
+        return { ...s, artifacts: { ...s.artifacts, [sessionKey]: [...merged.values()] } }
+      })
+      delete artifactBaselineRef.current[agentId]
+    }).catch(() => {})
+  }, [mutate])
 
   useEffect(() => {
     const cleanups: (() => void)[] = []
@@ -71,21 +207,31 @@ export default function App(): JSX.Element {
       for (const tab of data.tabs) {
         void refreshAgent(`agent-${tab.id}`)
       }
+      const hydrated: Record<string, Artifact[]> = {}
+      try {
+        const raw = window.localStorage.getItem('prime.files.runs.v1')
+        const saved = raw ? JSON.parse(raw) : {}
+        if (saved && typeof saved === 'object') {
+          for (const key of Object.keys(saved)) {
+            const items = saved[key]
+            if (Array.isArray(items)) hydrated[key] = items.filter((i) => i && typeof i === 'object' && typeof i.path === 'string')
+          }
+        }
+      } catch {
+        // Ignore malformed persisted run artifacts.
+      }
+      mutate((s) => ({
+        ...s,
+        artifacts: { ...s.artifacts, ...hydrated }
+      }))
     })
 
     async function refreshAgent(agentId: string) {
-      const [infos, msgs] = await Promise.all([
-        window.prime.agentState().catch(() => []),
-        window.prime.agentMessages(agentId).catch(() => [])
-      ])
+      const infos = await window.prime.agentState().catch(() => [])
       const infoList = infos as { id: string; [k: string]: unknown }[]
       const my = infoList.find((i) => i.id === agentId)
       if (my) {
         mutate((s) => ({ ...s, agents: { ...s.agents, [agentId]: my as never } }))
-      }
-      if (msgs && Array.isArray(msgs)) {
-        const reduced = (msgs as Record<string, unknown>[]).reduce<RenderMessage[]>(mergeMessage, [])
-        mutate((s) => ({ ...s, messages: { ...s.messages, [agentId]: reduced } }))
       }
     }
 
@@ -122,94 +268,37 @@ export default function App(): JSX.Element {
         mutate((s) => ({ ...s, agents: { ...s.agents, [agentId]: info } }))
         return
       }
-      case 'message_update': {
-        const ev = payload.assistantMessageEvent as Record<string, unknown> | undefined
-        const msg = payload.message as Record<string, unknown> | undefined
-        if (msg) {
-          mutate((s) => {
-            const cur = s.messages[agentId] ?? []
-            const norm = mergeMessage([], msg)[0]
-            if (ev?.type === 'text_delta' || ev?.type === 'thinking_delta') {
-              const merged = mergeMessage(cur, { ...msg })
-              const idx = merged.findIndex((m) => m.id === norm.id)
-              if (idx >= 0) merged[idx] = { ...merged[idx], streaming: true }
-              return { ...s, messages: { ...s.messages, [agentId]: merged } }
-            }
-            if (ev?.type === 'done' || ev?.type === 'error') {
-              const merged = mergeMessage(cur, msg)
-              const idx = merged.findIndex((m) => m.id === norm.id)
-              if (idx >= 0) merged[idx] = { ...merged[idx], streaming: false }
-              return { ...s, messages: { ...s.messages, [agentId]: merged } }
-            }
-            return { ...s, messages: { ...s.messages, [agentId]: mergeMessage(cur, msg) } }
-          })
-        }
+      case 'chat_focus': {
+        const tabId = String(payload.tabId ?? '')
+        if (tabId) mutate((s) => ({ ...s, activeChatByTab: { ...s.activeChatByTab, [tabId]: agentId } }))
         return
       }
-      case 'message_start':
-      case 'message_end': {
-        const msg = payload.message as Record<string, unknown> | undefined
-        if (msg) {
-          mutate((s) => ({
-            ...s,
-            messages: { ...s.messages, [agentId]: mergeMessage(s.messages[agentId] ?? [], msg) }
-          }))
-        }
+      case 'agent_closed': {
+        const tabId = String(payload.tabId ?? '')
+        mutate((s) => {
+          const agents = { ...s.agents }
+          delete agents[agentId]
+          const activeChatByTab = { ...s.activeChatByTab }
+          if (activeChatByTab[tabId] === agentId) delete activeChatByTab[tabId]
+          return { ...s, agents, activeChatByTab }
+        })
         return
       }
-      case 'custom_message': {
-        if (payload.customType === 'agent_message' && payload.display !== false) {
-          mutate((s) => ({
-            ...s,
-            messages: { ...s.messages, [agentId]: mergeMessage(s.messages[agentId] ?? [], { ...payload, role: 'assistant' }) }
-          }))
-        }
+      case 'turn_start': {
+        void window.prime.gitDiffFiles(agentId).then((rawDiffs) => {
+          const diffs = rawDiffs as FileDiff[]
+          artifactBaselineRef.current[agentId] = Object.fromEntries(
+            diffs.map((diff) => [diff.path, diff.diff])
+          )
+        }).catch(() => {
+          artifactBaselineRef.current[agentId] = {}
+        })
         return
       }
       case 'turn_end': {
         const msg = payload.message as Record<string, unknown> | undefined
-        const results = payload.toolResults as Record<string, unknown>[] | undefined
-        mutate((s) => {
-          let messages = s.messages[agentId] ?? []
-          if (msg) messages = mergeMessage(messages, msg)
-          if (results) {
-            for (const r of results) {
-              const rmsg: Record<string, unknown> = {
-                id: `tr-${r.toolCallId}`,
-                role: 'toolResult',
-                toolCallId: r.toolCallId,
-                toolName: r.toolName,
-                content: r.content,
-                isError: r.isError
-              }
-              messages = mergeMessage(messages, rmsg)
-              const tool = messages.find((m) => m.id === `tr-${r.toolCallId}`)
-              if (tool) {
-                const blocks = Array.isArray(tool.content) ? [...tool.content] : []
-                void blocks
-              }
-            }
-          }
-          return {
-            ...s,
-            messages: { ...s.messages, [agentId]: messages },
-            toolExecs: { ...s.toolExecs, [agentId]: finishToolExecs(s.toolExecs[agentId] ?? {}, results) }
-          }
-        })
-        void refreshStats(agentId)
-        return
-      }
-      case 'tool_execution_start':
-      case 'tool_execution_update':
-      case 'tool_execution_end': {
-        const kind = type === 'tool_execution_start' ? 'start' : type === 'tool_execution_update' ? 'update' : 'end'
-        mutate((s) => ({
-          ...s,
-          toolExecs: {
-            ...s.toolExecs,
-            [agentId]: patchToolExecs(s.toolExecs[agentId] ?? {}, kind, payload)
-          }
-        }))
+        if (msg?.isError) showToast(errorMessage(msg), 'error')
+        refreshArtifacts(agentId, messageIdOf(msg))
         return
       }
       case 'extension_ui_request': {
@@ -229,20 +318,6 @@ export default function App(): JSX.Element {
             dialogs: { ...s.dialogs, [agentId]: [...(s.dialogs[agentId] ?? []), dialog] }
           }))
         }
-        return
-      }
-      case 'compaction_end': {
-        // Inject a system compaction marker into the active agent's messages
-        const compactMsg: RenderMessage = {
-          id: `compact-${Date.now()}`,
-          role: 'system',
-          content: 'Context automatically compacted',
-          compaction: true
-        } as RenderMessage & { compaction: boolean }
-        mutate((s) => ({
-          ...s,
-          messages: { ...s.messages, [agentId]: [...(s.messages[agentId] ?? []), compactMsg] }
-        }))
         return
       }
       case 'session_action_update': {
@@ -267,13 +342,6 @@ export default function App(): JSX.Element {
     }
   }
 
-  async function refreshStats(agentId: string) {
-    const stats = await window.prime.agentStats(agentId).catch(() => null)
-    if (stats) {
-      void stats
-    }
-  }
-
   async function openFolder() {
     const path = await window.prime.chooseFolder()
     if (!path) return
@@ -284,19 +352,61 @@ export default function App(): JSX.Element {
       tabs,
       activeTabId: res.activeTabId,
       agents: s.agents,
-      messages: { ...s.messages, [`agent-${res.activeTabId}`]: [] },
       activeAgentId: `agent-${res.activeTabId}`
     }))
   }
 
   const activeAgentId = useMemo(() => {
-    if (state.activeTabId) return `agent-${state.activeTabId}`
+    if (state.activeTabId) {
+      const chosen = state.activeChatByTab[state.activeTabId]
+      return chosen && state.agents[chosen] ? chosen : `agent-${state.activeTabId}`
+    }
     const first = Object.keys(state.agents)[0]
     return first ?? null
-  }, [state.activeTabId, state.agents])
+  }, [state.activeTabId, state.activeChatByTab, state.agents])
 
   const activeInfo = activeAgentId ? state.agents[activeAgentId] : null
   const activeTab = state.tabs.find((t) => t.id === state.activeTabId) ?? null
+
+  const startNewChat = useCallback(() => {
+    navigate('chat')
+    if (activeAgentId) {
+      void window.prime.agentCommand(activeAgentId, { type: 'new_session' } as never)
+        .catch((err) => showToast(err instanceof Error ? err.message : String(err), 'error'))
+    }
+  }, [activeAgentId, navigate, showToast])
+
+  const runPaletteItem = useCallback((item: PaletteItem) => {
+    if (item.action === 'new-chat') {
+      startNewChat()
+      return
+    }
+    if (item.action === 'quit') {
+      void window.prime.quit()
+      return
+    }
+    if (item.action === 'set-model' && activeAgentId && item.provider && item.modelId) {
+      void window.prime.agentCommand(activeAgentId, { type: 'set_model', provider: item.provider, modelId: item.modelId } as never)
+        .then(() => showToast(item.label.replace(/^Switch to /, 'Model set to '), 'success'))
+        .catch((err) => showToast(err instanceof Error ? err.message : String(err), 'error'))
+      return
+    }
+    if (item.action === 'resume-session' && activeAgentId && item.sessionFile) {
+      void window.prime.agentResume(activeAgentId, item.sessionFile)
+        .then(() => navigate('chat'))
+        .catch((err) => showToast(err instanceof Error ? err.message : String(err), 'error'))
+      return
+    }
+    if (item.slash !== undefined) {
+      const view = stateRef.current.view
+      if (view !== 'chat' && view !== 'autonomy') {
+        showToast('Open a project chat to run this command', 'info')
+        return
+      }
+      window.dispatchEvent(new CustomEvent('prime:palette-slash', { detail: item.slash }))
+      return
+    }
+  }, [activeAgentId, navigate, showToast, startNewChat])
   const activeFleet = useMemo(() => {
     if (!activeAgentId) return []
     return state.fleet.filter((entry) => (
@@ -356,17 +466,20 @@ export default function App(): JSX.Element {
         state={state}
         activeAgentId={activeAgentId}
         collapsed={sidebarCollapsed}
-        onToggle={() => setSidebarCollapsed((v) => !v)}
-        onView={(v) => mutate((s) => ({ ...s, view: v }))}
-        onNewChat={() => {
-          mutate((s) => ({ ...s, view: 'chat' }))
-          if (activeAgentId) {
-            void window.prime.agentCommand(activeAgentId, { type: 'new_session' } as never)
-          }
+        hoverOpen={sidebarCollapsed && sidebarHoverOpen}
+        onHoverLeave={() => setSidebarHoverOpen(false)}
+        onToggle={() => {
+          setSidebarHoverOpen(false)
+          setSidebarCollapsed((v) => !v)
         }}
+        onView={(v) => navigate(v)}
+        canGoBack={backHistoryRef.current.length > 0}
+        canGoForward={forwardHistoryRef.current.length > 0}
+        onBack={goBack}
+        onForward={goForward}
+        onNewChat={startNewChat}
         onSelectTab={(id) => {
-          mutate((s) => ({ ...s, activeTabId: id, view: 'chat' }))
-          void window.prime.tabSelect(id)
+          navigate('chat', id)
         }}
         onCloseTab={(id) => {
           void window.prime.tabRemove(id).then((res) => {
@@ -374,20 +487,28 @@ export default function App(): JSX.Element {
           })
         }}
         onOpenFolder={() => void openFolder()}
+        onFocusChat={(tabId, agentId) => {
+          mutate((s) => ({ ...s, activeChatByTab: { ...s.activeChatByTab, [tabId]: agentId } }))
+        }}
       />
+      {sidebarCollapsed && !sidebarHoverOpen && (
+        <div className="sidebar-hover-trigger" aria-hidden="true" onMouseEnter={() => setSidebarHoverOpen(true)} />
+      )}
       <div className="app-main">
         <TabBar
           inspectorOpen={sidePanelOpen}
           onToggleInspector={() => setSidePanelOpen((open) => !open)}
           sidebarCollapsed={sidebarCollapsed}
-          onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
-          onNewChat={() => {
-            mutate((s) => ({ ...s, view: 'chat' }))
-            if (activeAgentId) {
-              void window.prime.agentCommand(activeAgentId, { type: 'new_session' } as never)
-            }
+          onToggleSidebar={() => {
+            setSidebarHoverOpen(false)
+            setSidebarCollapsed((value) => !value)
           }}
+          onNewChat={startNewChat}
           onOpenProject={() => void openFolder()}
+          canGoBack={backHistoryRef.current.length > 0}
+          canGoForward={forwardHistoryRef.current.length > 0}
+          onBack={goBack}
+          onForward={goForward}
           projectName={activeTab?.name}
         />
         <div className="app-body">
@@ -397,19 +518,25 @@ export default function App(): JSX.Element {
             <>
               <main className="main-pane">
                 {(state.view === 'chat' || state.view === 'autonomy') && activeAgentId && (
+                  <ErrorBoundary key={`chat-${activeAgentId}`} label="This chat">
                   <ChatView
+                    key={activeAgentId}
                     agentId={activeAgentId}
                     info={activeInfo}
                     tab={activeTab}
+                    artifacts={state.artifacts[`${activeAgentId}::${activeInfo?.sessionId ?? ''}`] ?? []}
+                    onOpenArtifacts={(path) => {
+                      setSidePanelTab('files')
+                      setSidePanelOpen(true)
+                      setFilesPreviewPath(path ?? null)
+                    }}
                     projects={state.tabs}
-                    accessMode={accessMode}
-                    onAccessModeChange={setAccessMode}
                     rlmMaxDepth={state.settings.rlmMaxDepth ?? 1}
                     onDepthChange={(depth) => {
                       mutate((s) => ({ ...s, settings: { ...s.settings, rlmMaxDepth: depth } }))
                       void window.prime.rlmSet(activeAgentId, depth, true)
                     }}
-                    onNavigate={(view) => mutate((s) => ({ ...s, view }))}
+                    onNavigate={(view) => navigate(view)}
                     onOpenGit={() => {
                       setSidePanelTab('git')
                       setSidePanelOpen(true)
@@ -422,18 +549,11 @@ export default function App(): JSX.Element {
                       setSidePanelOpen(true)
                     }}
                     onSelectProject={(projectId) => {
-                      mutate((s) => ({ ...s, activeTabId: projectId, view: 'chat' }))
-                      void window.prime.tabSelect(projectId)
+                      navigate('chat', projectId)
                     }}
                     onNewProject={() => void openFolder()}
                     showReasoning={state.settings.showReasoning !== false}
-                    onToast={(text, kind = 'info') => {
-                      const t = { id: `t-${Date.now()}`, kind, text }
-                      mutate((s) => ({ ...s, toasts: [...s.toasts.slice(-4), t] }))
-                      setTimeout(() => {
-                        mutate((s) => ({ ...s, toasts: s.toasts.filter((x) => x.id !== t.id) }))
-                      }, 4000)
-                    }}
+                    onToast={showToast}
                     onOpenSubagent={(entry) => {
                       const stored = findFleetEntry(activeFleet, entry)
                       const node = findSubagentNode(subagentTree, entry)
@@ -465,44 +585,54 @@ export default function App(): JSX.Element {
                         ))
                         const matched = findFleetEntry(scopedFleet, scopedEntry)
                         const index = matched ? s.fleet.indexOf(matched) : -1
-                        if (index < 0) return { ...s, fleet: [...s.fleet, scopedEntry] }
-                        const fleet = [...s.fleet]
-                        fleet[index] = {
-                          ...fleet[index],
+                        if (index < 0) return { ...s, fleet: [...s.fleet.slice(-199), scopedEntry] }
+                        const updated = {
+                          ...s.fleet[index],
                           ...scopedEntry,
-                          parentText: scopedEntry.parentText || fleet[index].parentText,
-                          childText: scopedEntry.childText || fleet[index].childText,
-                          payload: { ...(fleet[index].payload ?? {}), ...(scopedEntry.payload ?? {}) }
+                          parentText: scopedEntry.parentText || s.fleet[index].parentText,
+                          childText: scopedEntry.childText || s.fleet[index].childText,
+                          payload: { ...(s.fleet[index].payload ?? {}), ...(scopedEntry.payload ?? {}) }
                         }
+                        // ChatView reports every subagent block on each streamed
+                        // update; returning the same state skips an app-wide render.
+                        if (sameFleetEntry(s.fleet[index], updated)) return s
+                        const fleet = [...s.fleet]
+                        fleet[index] = updated
                         return { ...s, fleet }
                       })
                       setSelectedFleetEntry((current) => {
                         if (!current || !entriesReferToSameAgent(current, entry)) return current
-                        return {
+                        const updated = {
                           ...current,
                           ...entry,
                           parentText: entry.parentText || current.parentText,
                           childText: entry.childText || current.childText,
                           payload: { ...(entry.payload ?? {}), ...(current.payload ?? {}) }
                         }
+                        return sameFleetEntry(current, updated) ? current : updated
                       })
                     }}
                   />
+                  </ErrorBoundary>
                 )}
-                {state.view === 'fleet' && <FleetView state={state} />}
-                {state.view === 'approval' && <ApprovalView activeAgentId={activeAgentId} projectPath={activeTab?.path ?? null} />}
-                {state.view === 'dashboard' && <DashboardView />}
-                {state.view === 'skills' && <SkillsView activeAgentId={activeAgentId} />}
-                {state.view === 'diagnostics' && <DiagnosticsView activeAgentId={activeAgentId} />}
-                {state.view === 'settings' && (
-                  <SettingsView
-                    settings={state.settings}
-                    activeAgentId={activeAgentId}
-                    onChange={(patch) => {
-                      mutate((s) => ({ ...s, settings: { ...s.settings, ...patch } }))
-                      void window.prime.settingsSet(patch)
-                    }}
-                  />
+                {state.view !== 'chat' && state.view !== 'autonomy' && (
+                  <ErrorBoundary key={state.view} label="This page">
+                    {state.view === 'fleet' && <FleetView state={state} />}
+                    {state.view === 'approval' && <ApprovalView activeAgentId={activeAgentId} />}
+                    {state.view === 'dashboard' && <DashboardView />}
+                    {state.view === 'skills' && <SkillsView activeAgentId={activeAgentId} />}
+                    {state.view === 'diagnostics' && <DiagnosticsView activeAgentId={activeAgentId} />}
+                    {state.view === 'settings' && (
+                      <SettingsView
+                        settings={state.settings}
+                        activeAgentId={activeAgentId}
+                        onChange={(patch) => {
+                          mutate((s) => ({ ...s, settings: { ...s.settings, ...patch } }))
+                          void window.prime.settingsSet(patch)
+                        }}
+                      />
+                    )}
+                  </ErrorBoundary>
                 )}
               </main>
               <SidePanel
@@ -511,8 +641,13 @@ export default function App(): JSX.Element {
                 fleet={activeFleet}
                 tree={subagentTree}
                 agentId={activeAgentId}
+                sessionId={activeInfo?.sessionId ?? null}
+                artifacts={state.artifacts[`${activeAgentId}::${activeInfo?.sessionId ?? ''}`] ?? []}
+                onToast={showToast}
                 activeTab={sidePanelTab}
                 onTabChange={setSidePanelTab}
+                filesPreviewPath={filesPreviewPath}
+                onFilesPreviewPathChange={setFilesPreviewPath}
                 selectedEntry={selectedFleetEntry}
                 onSelectEntry={setSelectedFleetEntry}
                 showReasoning={state.settings.showReasoning !== false}
@@ -522,6 +657,13 @@ export default function App(): JSX.Element {
         </div>
       </div>
       <Toasts toasts={state.toasts} />
+      <CommandPalette
+        open={paletteOpen}
+        agentId={activeAgentId}
+        onClose={() => setPaletteOpen(false)}
+        onNavigate={(view) => { if (view) navigate(view) }}
+        onRun={runPaletteItem}
+      />
       <DialogHost dialogs={Object.values(state.dialogs).flat()} onRespond={(id, value, cancelled) => {
         void window.prime.dialogRespond(id, value, cancelled)
         mutate((s) => {
@@ -579,6 +721,16 @@ function findFleetEntry(fleet: FleetEntry[], entry: FleetEntry): FleetEntry | un
   if (exact || !isLegacyEntry(entry)) return exact
   const named = fleet.filter((candidate) => isLegacyEntry(candidate) && candidate.label === entry.label)
   return named.length === 1 ? named[0] : undefined
+}
+
+function sameFleetEntry(left: FleetEntry, right: FleetEntry): boolean {
+  return left.label === right.label
+    && left.text === right.text
+    && left.parentText === right.parentText
+    && left.childText === right.childText
+    && left.status === right.status
+    && left.depth === right.depth
+    && JSON.stringify(left.payload ?? {}) === JSON.stringify(right.payload ?? {})
 }
 
 function summarizeEvent(payload: Record<string, unknown>): string {

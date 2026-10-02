@@ -208,7 +208,7 @@ export class RpcClient extends EventEmitter {
 }
 
 function extraPath(): string {
-  return ['/opt/homebrew/bin', '/usr/local/bin', join(homedir(), '.local/bin'), join(homedir(), '.hermes/node/bin')].join(':')
+  return ['/opt/homebrew/bin', '/usr/local/bin', join(homedir(), '.local/bin')].join(':')
 }
 
 function childEnv(overrides?: Record<string, string>): NodeJS.ProcessEnv {
@@ -223,8 +223,7 @@ function findNode(): string {
   for (const candidate of [
     '/opt/homebrew/bin/node',
     '/usr/local/bin/node',
-    join(homedir(), '.local/bin/node'),
-    join(homedir(), '.hermes/node/bin/node')
+    join(homedir(), '.local/bin/node')
   ]) {
     if (existsSync(candidate)) return candidate
   }

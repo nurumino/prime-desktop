@@ -1,13 +1,57 @@
 import type { BrowserWindow, IpcMainInvokeEvent } from 'electron'
 import { existsSync, statSync } from 'fs'
-import { isAbsolute, normalize, resolve, sep } from 'path'
+import { isAbsolute, join, normalize, resolve, sep } from 'path'
+import { fileURLToPath } from 'url'
 import type { AgentCommand } from '@shared/types'
 
-export function assertTrustedRenderer(event: IpcMainInvokeEvent, getWindow: () => BrowserWindow | null): void {
+// main, preload, and renderer are emitted side by side under out/.
+export function rendererIndexFile(): string {
+  return join(__dirname, '../renderer/index.html')
+}
+
+// The app's own page: the dev server origin in development, otherwise the
+// bundled file:// index.html (query/hash ignored). Everything else is foreign.
+export function isAppUrl(url: string, devUrl: string | undefined, indexFile?: string): boolean {
+  let target: URL
+  try {
+    target = new URL(url)
+  } catch {
+    return false
+  }
+  if (devUrl) {
+    try {
+      const dev = new URL(devUrl)
+      return (dev.protocol === 'http:' || dev.protocol === 'https:') && target.origin === dev.origin
+    } catch {
+      return false
+    }
+  }
+  if (target.protocol !== 'file:') return false
+  if (!indexFile) return true
+  try {
+    return normalize(fileURLToPath(target)) === normalize(resolve(indexFile))
+  } catch {
+    return false
+  }
+}
+
+export function assertTrustedRenderer(
+  event: IpcMainInvokeEvent,
+  getWindow: () => BrowserWindow | null,
+  devUrl: string | undefined = process.env['ELECTRON_RENDERER_URL'],
+  indexFile: string = rendererIndexFile()
+): void {
   const window = getWindow()
   if (!window || window.isDestroyed() || event.sender !== window.webContents) {
     throw new Error('Untrusted IPC sender')
   }
+  // Only the top-level app document may call privileged IPC; a subframe or a
+  // page the window was somehow navigated to must not inherit that access.
+  const frame = event.senderFrame
+  if (!frame || (frame !== window.webContents.mainFrame && frame.parent !== null)) {
+    throw new Error('Untrusted IPC sender')
+  }
+  if (!isAppUrl(frame.url, devUrl, indexFile)) throw new Error('Untrusted IPC sender')
 }
 
 export function requireString(value: unknown, name: string, maxLength = 200_000): string {

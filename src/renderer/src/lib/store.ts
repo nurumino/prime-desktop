@@ -1,4 +1,4 @@
-import type { AppSettings, BinaryState, ProjectTab, ViewId } from '@shared/types'
+import type { AppSettings, Artifact, BinaryState, ProjectTab, ViewId } from '@shared/types'
 import { CODEX_DARK_THEME, PRIME_LIGHT_THEME } from '@shared/themes'
 
 export interface Block {
@@ -10,6 +10,7 @@ export interface Block {
   arguments?: unknown
   status?: 'pending' | 'running' | 'done' | 'error'
   result?: string
+  reasoning?: string
   isError?: boolean
   agentName?: string
   agentId?: string
@@ -33,8 +34,23 @@ export interface ToolExecState {
   toolName: string
   args: Record<string, unknown> | string
   output: string
+  reasoning?: string
   status: 'pending' | 'running' | 'done' | 'error'
   isError?: boolean
+}
+
+const MAX_TOOL_OUTPUT_CHARS = 12_000
+
+function boundedToolOutput(value: string): string {
+  if (value.length <= MAX_TOOL_OUTPUT_CHARS) return value
+  return `${value.slice(0, MAX_TOOL_OUTPUT_CHARS)}\n… tool output truncated …`
+}
+
+/** Tools that call an LLM (e.g. moremi_generate) stream their reasoning in `details.reasoning`. */
+export function extractReasoning(details: unknown): string | undefined {
+  if (!details || typeof details !== 'object') return undefined
+  const reasoning = (details as { reasoning?: unknown }).reasoning
+  return typeof reasoning === 'string' && reasoning ? boundedToolOutput(reasoning) : undefined
 }
 
 export interface FleetEntry {
@@ -59,8 +75,6 @@ export interface AppState {
   tabs: ProjectTab[]
   activeTabId: string | null
   agents: Record<string, import('@shared/types').AgentInfo>
-  messages: Record<string, RenderMessage[]>
-  toolExecs: Record<string, Record<string, ToolExecState>>
   dialogs: Record<string, import('@shared/types').UiDialog[]>
   toasts: { id: string; kind: 'info' | 'success' | 'warning' | 'error'; text: string }[]
   view: ViewId
@@ -72,11 +86,13 @@ export interface AppState {
   heartbeats: Record<string, import('@shared/types').Heartbeat | null>
   checkpoints: Record<string, import('@shared/types').Checkpoint[]>
   diffs: Record<string, import('@shared/types').FileDiff[]>
+  artifacts: Record<string, Artifact[]>
   skills: Record<string, import('@shared/types').SkillInfo[]>
-  permissions: import('@shared/types').PermissionRule[]
   fleet: FleetEntry[]
   models: string[]
   activeAgentId: string | null
+  /** The chat shown for each project; a project can run several at once. */
+  activeChatByTab: Record<string, string>
 }
 
 export const initialState: AppState = {
@@ -85,8 +101,6 @@ export const initialState: AppState = {
   tabs: [],
   activeTabId: null,
   agents: {},
-  messages: {},
-  toolExecs: {},
   dialogs: {},
   toasts: [],
   view: 'chat',
@@ -122,11 +136,12 @@ export const initialState: AppState = {
   heartbeats: {},
   checkpoints: {},
   diffs: {},
+  artifacts: {},
   skills: {},
-  permissions: [],
   fleet: [],
   models: [],
-  activeAgentId: null
+  activeAgentId: null,
+  activeChatByTab: {}
 }
 
 export function agentIdForTab(state: AppState): string | null {
@@ -148,6 +163,27 @@ export function normalizeBlocks(msg: Record<string, unknown>): RenderMessage {
     content: '',
     toolCallId: msg.toolCallId as string | undefined
   }
+  if (msg.customType === 'rlm_child_failure' || msg.customType === 'rlm_child_terminal_notice') {
+    const details = msg.details as { sessionName?: string; error?: string; kind?: string; reason?: string; lastAssistantTextPreview?: string } | undefined
+    const label = details?.sessionName ?? 'Subagent'
+    base.role = 'system'
+    base.content = msg.customType === 'rlm_child_failure'
+      ? `${label} failed: ${details?.error ?? String(content ?? '').replace(/^\[child-failed[^\]]*\]\s*/, '')}`
+      : details?.kind === 'cancelled'
+        ? `${label} was cancelled${details.reason ? `: ${details.reason}` : '.'}`
+        : `${label} finished without a reply.${details?.lastAssistantTextPreview ? ` ${details.lastAssistantTextPreview}` : ''}`
+    return base
+  }
+  if (msg.customType === 'refinement_outcome') {
+    const details = msg.details as { edits?: { applied?: boolean; action: string; kind: string; id: string; after?: { scope?: string; title?: string; content?: string }; before?: { scope?: string; title?: string; content?: string } }[]; scope?: string } | undefined
+    const edits = (Array.isArray(details?.edits) ? details.edits : []).filter((edit) => edit?.applied).map((edit) => {
+      const entry = edit.after ?? edit.before
+      return `- ${edit.action} ${edit.kind} [${entry?.scope ?? details?.scope ?? 'local'}:${edit.id}] ${entry?.title ?? edit.id}: ${entry?.content ?? ''}`
+    })
+    base.role = 'assistant'
+    base.content = `${String(content ?? 'Refinement complete:')}\n\n[refinement]\n${edits.join('\n') || 'No changes applied.'}`
+    return base
+  }
   if (typeof content === 'string') {
     const child = parseChildMessage(content, msg.details)
     base.content = child ? [child] : content
@@ -168,7 +204,8 @@ export function normalizeBlocks(msg: Record<string, unknown>): RenderMessage {
             name: b.name as string,
             arguments: b.arguments,
             status: (b.status as Block['status']) ?? 'done',
-            result: typeof b.result === 'string' ? b.result : undefined,
+            result: typeof b.result === 'string' ? boundedToolOutput(b.result) : undefined,
+            reasoning: extractReasoning(b.details),
             isError: Boolean(b.isError)
           }
           return tool
@@ -179,6 +216,7 @@ export function normalizeBlocks(msg: Record<string, unknown>): RenderMessage {
             id: b.toolCallId as string,
             name: (b.toolName as string) ?? 'tool',
             result: extractText(b.content),
+            reasoning: extractReasoning(b.details),
             status: b.isError ? 'error' : 'done',
             isError: Boolean(b.isError)
           }
@@ -226,9 +264,10 @@ export function patchToolExecs(
       }
     }
   }
-  const partial = payload.partialResult as { content?: unknown } | undefined
-  const result = payload.result as { content?: unknown } | undefined
-  const output = extractText((event === 'end' ? result?.content : partial?.content) ?? payload.content)
+  const partial = payload.partialResult as { content?: unknown; details?: unknown } | undefined
+  const result = payload.result as { content?: unknown; details?: unknown } | undefined
+  const output = boundedToolOutput(extractText((event === 'end' ? result?.content : partial?.content) ?? payload.content))
+  const reasoning = extractReasoning((event === 'end' ? result?.details : partial?.details) ?? payload.details) ?? cur?.reasoning
   if (event === 'update') {
     if (alreadyDone) return prev
     return {
@@ -238,6 +277,7 @@ export function patchToolExecs(
         toolName: String(payload.toolName ?? cur?.toolName ?? 'tool'),
         args: (payload.args as Record<string, unknown>) ?? cur?.args ?? {},
         output: output || cur?.output || '',
+        reasoning,
         status: 'running'
       }
     }
@@ -249,6 +289,7 @@ export function patchToolExecs(
       toolName: String(payload.toolName ?? cur?.toolName ?? 'tool'),
       args: (payload.args as Record<string, unknown>) ?? cur?.args ?? {},
       output: output || cur?.output || '',
+      reasoning,
       status: payload.isError ? 'error' : 'done',
       isError: Boolean(payload.isError)
     }
@@ -299,15 +340,35 @@ export function mergeMessage(prev: RenderMessage[], msg: Record<string, unknown>
       if (!Array.isArray(content)) continue
       const blockIndex = content.findIndex((block) => block.type === 'toolCall' && block.id === norm.toolCallId)
       if (blockIndex < 0) continue
-      const result = extractText(msg.content)
+      const result = boundedToolOutput(extractText(msg.content))
       const blocks = [...content]
-      blocks[blockIndex] = { ...blocks[blockIndex], result, status: msg.isError ? 'error' : 'done', isError: Boolean(msg.isError) }
+      blocks[blockIndex] = { ...blocks[blockIndex], result, reasoning: extractReasoning(msg.details) ?? blocks[blockIndex].reasoning, status: msg.isError ? 'error' : 'done', isError: Boolean(msg.isError) }
       copy[i] = { ...copy[i], content: blocks }
       return copy
     }
   }
   const idx = prev.findIndex((m) => m.id === norm.id)
   if (idx === -1) return [...prev, norm]
+  const oldContent = prev[idx].content
+  if (norm.role === 'assistant' && Array.isArray(oldContent) && Array.isArray(norm.content)) {
+    const incoming = norm.content
+    const oldCalls = new Map(oldContent.filter((b) => b.type === 'toolCall' && b.id).map((b) => [b.id, b]))
+    norm.content = incoming.map((block) => {
+      const old = block.type === 'toolCall' ? oldCalls.get(block.id) : undefined
+      if (!old) return block
+      return old.result !== undefined || old.status === 'error'
+        ? { ...block, result: old.result, status: old.status, isError: old.isError }
+        : block
+    })
+    // Stream snapshots can omit earlier calls. Keep their order and results.
+    const ids = new Set(incoming.filter((b) => b.type === 'toolCall').map((b) => b.id))
+    for (let i = 0; i < oldContent.length; i++) {
+      const block = oldContent[i]
+      if (block.type === 'toolCall' && block.id && !ids.has(block.id)) {
+        norm.content.splice(Math.min(i, norm.content.length), 0, block)
+      }
+    }
+  }
   const copy = [...prev]
   copy[idx] = norm
   return copy

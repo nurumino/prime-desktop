@@ -6,9 +6,7 @@ interface Props {
   disabled?: boolean
 }
 
-const LABELS = ['Off', 'One hop', 'Shallow', 'Deep'] as const
-
-function depthLabel(value: number): string {
+export function depthLabel(value: number): string {
   if (value === 0) return 'No recursion'
   if (value === 1) return 'One hop'
   if (value <= 3) return 'Shallow'
@@ -97,12 +95,6 @@ export default function DepthSlider({ value, onChange, disabled }: Props): JSX.E
             </button>
           ))}
         </div>
-      </div>
-
-      <div className="depth-legend">
-        {LABELS.map((label) => (
-          <span key={label}>{label}</span>
-        ))}
       </div>
     </div>
   )

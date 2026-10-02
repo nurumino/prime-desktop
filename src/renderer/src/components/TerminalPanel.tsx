@@ -18,7 +18,7 @@ interface DataEvent {
   endOffset: number
 }
 
-export default function TerminalPanel({ agentId }: { agentId: string | null }): JSX.Element {
+export default function TerminalPanel({ agentId, onToast }: { agentId: string | null; onToast?: (text: string, kind?: 'info' | 'success' | 'warning' | 'error') => void }): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -36,7 +36,7 @@ export default function TerminalPanel({ agentId }: { agentId: string | null }): 
       convertEol: true,
       cursorBlink: true,
       cursorStyle: 'bar',
-      fontFamily: "'SFMono-Regular', 'SF Mono', Menlo, Monaco, Consolas, monospace",
+      fontFamily: styles.getPropertyValue('--font-code').trim() || "'Geist Mono', monospace",
       fontSize: 12,
       lineHeight: 1.35,
       scrollback: 10_000,
@@ -70,6 +70,7 @@ export default function TerminalPanel({ agentId }: { agentId: string | null }): 
     fitRef.current = fit
     const refreshTheme = () => {
       const current = getComputedStyle(document.documentElement)
+      terminal.options.fontFamily = current.getPropertyValue('--font-code').trim() || "'Geist Mono', monospace"
       terminal.options.theme = {
         ...terminal.options.theme,
         background: current.getPropertyValue('--bg').trim(),
@@ -123,7 +124,9 @@ export default function TerminalPanel({ agentId }: { agentId: string | null }): 
           terminal.focus()
         })
         .catch((reason: unknown) => {
-          setError(reason instanceof Error ? reason.message : String(reason))
+          const message = reason instanceof Error ? reason.message : String(reason)
+          setError(message)
+          onToast?.(message, 'error')
           setStatus('error')
         })
     })
@@ -172,7 +175,9 @@ export default function TerminalPanel({ agentId }: { agentId: string | null }): 
         terminal.focus()
       })
       .catch((reason: unknown) => {
-        setError(reason instanceof Error ? reason.message : String(reason))
+        const message = reason instanceof Error ? reason.message : String(reason)
+        setError(message)
+        onToast?.(message, 'error')
         setStatus('error')
       })
   }
@@ -189,7 +194,7 @@ export default function TerminalPanel({ agentId }: { agentId: string | null }): 
         </div>
       </div>
       <div className="terminal-host" ref={hostRef} />
-      {status === 'error' && <div className="terminal-error">{error || 'Terminal could not start'}</div>}
+      {status === 'error' && <span className="sr-only">{error || 'Terminal could not start'}</span>}
     </div>
   )
 }
