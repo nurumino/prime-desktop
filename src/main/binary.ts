@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { promisify } from 'util'
+import { APP_SUPPORT_DIR, agentCommand, cliEntry, cliFromNpmShim } from './platform'
 import https from 'https'
 import { EventEmitter } from 'events'
 import { createHash } from 'crypto'
@@ -11,7 +12,7 @@ import { createHash } from 'crypto'
 const execFileAsync = promisify(execFile)
 
 const INSTALL_URL = 'https://app.primeintellect.ai/prime-agent/install.sh'
-const BIN_DIR = join(homedir(), 'Library', 'Application Support', 'PrimeDesktop', 'bin')
+const BIN_DIR = join(APP_SUPPORT_DIR, 'bin')
 const MAX_INSTALLER_BYTES = 2 * 1024 * 1024
 
 export class BinaryManager extends EventEmitter {
@@ -52,6 +53,8 @@ export class BinaryManager extends EventEmitter {
       this.state.path,
       process.env.PRIME_AGENT_PATH,
       join(BIN_DIR, 'prime-agent'),
+      // Linked by the team setup script; the only candidate it creates on Windows.
+      cliEntry(join(APP_SUPPORT_DIR, 'runtime')),
       join(homedir(), '.local', 'bin', 'prime-agent'),
       '/opt/homebrew/bin/prime-agent',
       '/usr/local/bin/prime-agent'
@@ -65,8 +68,12 @@ export class BinaryManager extends EventEmitter {
     }
 
     try {
-      const { stdout } = await execFileAsync('which', ['prime-agent'])
-      const p = stdout.trim()
+      const finder = process.platform === 'win32' ? 'where' : 'which'
+      const { stdout } = await execFileAsync(finder, ['prime-agent'])
+      const found = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+      const p = process.platform === 'win32'
+        ? found.map(cliFromNpmShim).find((cli): cli is string => Boolean(cli))
+        : found[0]
       if (p) {
         const version = await this.getVersion(p)
         return { path: p, version }
@@ -79,7 +86,8 @@ export class BinaryManager extends EventEmitter {
 
   private async getVersion(bin: string): Promise<string | null> {
     try {
-      const { stdout, stderr } = await execFileAsync(bin, ['--version'], { timeout: 10000 })
+      const { cmd, args } = agentCommand(bin)
+      const { stdout, stderr } = await execFileAsync(cmd, [...args, '--version'], { timeout: 10000, windowsHide: true })
       const text = (stdout + stderr).trim().split('\n')[0]
       return text || null
     } catch {
@@ -92,6 +100,9 @@ export class BinaryManager extends EventEmitter {
     this.state.progress = 0
     this.emit('change', this.stateSnapshot)
     try {
+      if (process.platform === 'win32') {
+        throw new Error('Automatic install is only available on macOS. Install Prime Agent as described in the README, then restart Prime Desktop.')
+      }
       await mkdir(BIN_DIR, { recursive: true })
       const script = await this.download(INSTALL_URL, (pct) => {
         this.state.progress = pct * 0.5

@@ -1,6 +1,8 @@
 import { EventEmitter } from 'events'
 import { spawn, type IPty } from 'node-pty'
 import { existsSync } from 'fs'
+import { homedir } from 'os'
+import { terminalShell } from './platform'
 
 const MAX_BUFFER = 200_000
 
@@ -26,9 +28,9 @@ export class TerminalManager extends EventEmitter {
     const existing = this.sessions.get(agentId)
     if (existing) return this.snapshot(existing)
 
-    const shell = resolveShell()
-    const resolvedCwd = existsSync(cwd) ? cwd : process.env.HOME || '/'
-    const pty = spawn(shell, ['-l'], {
+    const { shell, args } = terminalShell()
+    const resolvedCwd = existsSync(cwd) ? cwd : homedir()
+    const pty = spawn(shell, args, {
       name: 'xterm-256color',
       cols: clamp(cols, 20, 500),
       rows: clamp(rows, 5, 200),
@@ -101,13 +103,4 @@ export class TerminalManager extends EventEmitter {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.floor(value)))
-}
-
-function resolveShell(): string {
-  const configured = process.env.SHELL
-  if (configured && configured.startsWith('/') && existsSync(configured)) return configured
-  for (const shell of ['/bin/zsh', '/bin/bash', '/bin/sh']) {
-    if (existsSync(shell)) return shell
-  }
-  return '/bin/sh'
 }

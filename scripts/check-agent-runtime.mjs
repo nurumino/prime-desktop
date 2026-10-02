@@ -32,7 +32,10 @@ const server = createServer(async (req, res) => {
 })
 server.listen(0, '127.0.0.1')
 await once(server, 'listening')
-const socketPath = join(root, 'daemon.sock')
+// Windows daemons listen on named pipes, not socket files.
+const socketPath = process.platform === 'win32'
+  ? `\\\\.\\pipe\\prime-runtime-${process.pid}-${Date.now()}`
+  : join(root, 'daemon.sock')
 let transport
 let client
 try {

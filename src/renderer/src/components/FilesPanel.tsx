@@ -5,6 +5,7 @@ import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist'
 import katex from 'katex'
 import type { WorkBook } from 'xlsx'
 import 'katex/dist/katex.min.css'
+import { baseName } from '@shared/paths'
 
 interface Props {
   agentId: string | null
@@ -38,7 +39,7 @@ function kindFromPath(path: string): Artifact['kind'] {
 }
 
 function shortName(path: string): string {
-  return path.split('/').pop() || path
+  return baseName(path)
 }
 
 function kindLabel(kind: Artifact['kind']): string {

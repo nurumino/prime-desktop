@@ -5,6 +5,7 @@ import { homedir } from 'os'
 import { randomUUID } from 'crypto'
 import { join, basename, resolve } from 'path'
 import { RpcClient } from './rpc'
+import { APP_SUPPORT_DIR, desktopDaemonSocket } from './platform'
 import { DaemonTransport, type DaemonTreeNode } from './daemonTransport'
 import { BinaryManager } from './binary'
 import {
@@ -37,6 +38,7 @@ import {
   getMcpCatalog
 } from './primeFiles'
 import { modelKeyFromState, parseModelList } from '@shared/models'
+import { baseName } from '@shared/paths'
 import { isInternalStateRestoreMessage } from '@shared/messageVisibility'
 import type {
   AgentInfo,
@@ -61,8 +63,7 @@ import type {
 
 const SESSION_DIR = join(homedir(), '.prime', 'agent', 'sessions')
 const CHECKPOINT_DIR = join(homedir(), 'Library', 'Application Support', 'PrimeDesktop', 'checkpoints')
-const APP_SUPPORT_DIR = join(homedir(), 'Library', 'Application Support', 'PrimeDesktop')
-const APP_DAEMON_SOCKET = join(APP_SUPPORT_DIR, 'prime-agent.sock')
+const APP_DAEMON_SOCKET = desktopDaemonSocket()
 const MODELS_FILE = join(homedir(), '.prime', 'agent', 'models.json')
 
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.cache', '.turbo', '.prime'])
@@ -1389,7 +1390,7 @@ export class AgentManager extends EventEmitter {
               path: String(item.filePath ?? '')
             })),
             ...((snapshot.extensions as Record<string, unknown>[] | undefined) ?? []).map((item) => ({
-              name: String(item.path ?? '').split('/').pop() ?? 'extension',
+              name: baseName(String(item.path ?? '')) || 'extension',
               description: 'Prime Agent extension',
               source: 'extension' as const,
               location: String((item.sourceInfo as Record<string, unknown> | undefined)?.scope ?? ''),

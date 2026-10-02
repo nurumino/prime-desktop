@@ -1,12 +1,17 @@
 # Prime Desktop
 
-Prime Desktop is a macOS Electron client for [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent). It provides a focused chat workspace with streaming responses, tool activity, subagent inspection, session resume, model selection, project tabs, permissions, and review surfaces.
+Prime Desktop is an Electron client for [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent). It provides a focused chat workspace with streaming responses, tool activity, subagent inspection, session resume, model selection, project tabs, permissions, and review surfaces.
 
 ## Requirements
 
-- macOS
-- Node.js 20 or newer
-- A working `prime-agent` installation available on `PATH`
+- macOS, or Windows 10/11 (run from source with `npm run dev`; there is no Windows installer yet)
+- Node.js 22.18 or newer
+- An npm-style `prime-agent` installation that Prime Desktop can find. It checks these locations in order:
+  1. `PRIME_AGENT_PATH`
+  2. `<home>/Library/Application Support/PrimeDesktop/bin/prime-agent`
+  3. `<home>/Library/Application Support/PrimeDesktop/runtime/node_modules/prime-agent/dist/bundle/cli.js`
+  4. `prime-agent` on `PATH` (via `which`, or `where` on Windows)
+- Windows only: [Git for Windows](https://git-scm.com/download/win), because Prime Agent needs Git Bash. Node.js must be on `PATH`, since Prime Agent's `cli.js` runs through `node` there. The built-in terminal opens PowerShell.
 
 ## Development
 

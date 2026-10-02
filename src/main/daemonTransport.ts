@@ -4,6 +4,7 @@ import { existsSync, realpathSync, unlinkSync } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import { pathToFileURL } from 'url'
+import { agentCommand, isNamedPipe } from './platform'
 import type { AppSettings, ExternalAgentInfo, SubagentNode } from '@shared/types'
 
 export interface DaemonConnection {
@@ -152,7 +153,8 @@ export function defaultCliDaemonSocket(): string {
 
 export async function listExternalSessions(binary: string): Promise<ExternalAgentInfo[]> {
   const socketPath = defaultCliDaemonSocket()
-  if (!existsSync(socketPath)) return []
+  // Named pipes can't be checked with existsSync; the connect timeout covers a missing daemon.
+  if (!isNamedPipe(socketPath) && !existsSync(socketPath)) return []
   let client: DaemonClientLike
   try {
     const { DaemonClient } = await loadModules(binary)
@@ -239,10 +241,12 @@ async function connectWithStartup(
     first.close()
   }
 
-  const daemon = spawn(binary, ['--mode', 'daemon', '--daemon-socket', socketPath], {
+  const { cmd, args } = agentCommand(binary)
+  const daemon = spawn(cmd, [...args, '--mode', 'daemon', '--daemon-socket', socketPath], {
     detached: true,
     env: childEnv(),
-    stdio: 'ignore'
+    stdio: 'ignore',
+    windowsHide: true
   })
   daemon.unref()
   let lastError: unknown

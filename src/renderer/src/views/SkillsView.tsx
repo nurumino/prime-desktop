@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { SkillInfo } from '@shared/types'
+import { baseName } from '@shared/paths'
 
 interface Props {
   activeAgentId: string | null
@@ -154,7 +155,7 @@ export default function SkillsView({ activeAgentId }: Props): JSX.Element {
             <div className="resource-group-title">Extensions <span>{resources?.extensions.length ?? 0}</span></div>
             {resources?.extensions.map((item) => (
               <div className="resource-row" key={item.path}>
-                <code>{item.path.split('/').pop()}</code>
+                <code>{baseName(item.path)}</code>
                 <span>{item.sourceInfo?.scope ?? 'loaded'}</span>
               </div>
             ))}
@@ -164,7 +165,7 @@ export default function SkillsView({ activeAgentId }: Props): JSX.Element {
             <div className="resource-group-title">Themes <span>{resources?.themes.length ?? 0}</span></div>
             {resources?.themes.map((item, index) => (
               <div className="resource-row" key={`${item.sourcePath}-${index}`}>
-                <code>{item.name || item.sourcePath?.split('/').pop() || 'theme'}</code>
+                <code>{item.name || (item.sourcePath && baseName(item.sourcePath)) || 'theme'}</code>
                 <span>{item.sourceInfo?.scope ?? 'loaded'}</span>
               </div>
             ))}
