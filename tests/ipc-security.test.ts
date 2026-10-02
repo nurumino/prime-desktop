@@ -1,3 +1,4 @@
+import { pathToFileURL } from 'url'
 import { describe, expect, it } from 'vitest'
 import type { BrowserWindow, IpcMainInvokeEvent } from 'electron'
 import { assertTrustedRenderer, isAppUrl, isWithin, requireSafeExternalUrl } from '../src/main/ipcSecurity'
@@ -25,12 +26,12 @@ describe('isAppUrl', () => {
     expect(isAppUrl('http://localhost:5174/', dev)).toBe(false)
     expect(isAppUrl('https://localhost:5173/', dev)).toBe(false)
     expect(isAppUrl('http://evil.test/', dev)).toBe(false)
-    expect(isAppUrl(`file://${index}`, dev)).toBe(false)
+    expect(isAppUrl(pathToFileURL(index).href, dev)).toBe(false)
   })
 
   it('matches the bundled index.html in production', () => {
-    expect(isAppUrl(`file://${index}`, undefined, index)).toBe(true)
-    expect(isAppUrl(`file://${index}#/settings`, undefined, index)).toBe(true)
+    expect(isAppUrl(pathToFileURL(index).href, undefined, index)).toBe(true)
+    expect(isAppUrl(`${pathToFileURL(index).href}#/settings`, undefined, index)).toBe(true)
     expect(isAppUrl('file:///etc/passwd', undefined, index)).toBe(false)
     expect(isAppUrl('https://example.com/', undefined, index)).toBe(false)
     expect(isAppUrl('http://localhost:5173/', undefined, index)).toBe(false)

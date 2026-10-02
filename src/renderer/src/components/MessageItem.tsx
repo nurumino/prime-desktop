@@ -4,6 +4,7 @@ import type { Artifact } from '@shared/types'
 import type { Block, FleetEntry, RenderMessage, ToolExecState } from '../lib/store'
 import SubagentMark from './SubagentMark'
 import WorkingMark from './WorkingMark'
+import { baseName } from '@shared/paths'
 
 const USER_COLLAPSE_THRESHOLD = 280
 
@@ -39,10 +40,6 @@ function pathsInCode(code: string): string[] {
   return [...code.matchAll(/['"]((?:\/|\.\/|\.\.\/)?[^'"]+\.[A-Za-z0-9]{1,8})['"]/g)].map((m) => m[1])
 }
 
-function basename(path: string): string {
-  const parts = path.split('/')
-  return parts[parts.length - 1] || path
-}
 
 function classifyIpython(code: string): ToolCategory {
   const c = code.trim()
@@ -70,12 +67,9 @@ function extractFilename(args: unknown): string {
   if (!args || typeof args !== 'object') return ''
   const r = args as Record<string, unknown>
   const raw = String(r.TargetFile ?? r.target_file ?? r.path ?? r.file ?? r.AbsolutePath ?? r.absolute_path ?? r.SearchPath ?? '')
-  if (raw) {
-    const parts = raw.split('/')
-    return parts[parts.length - 1] || raw
-  }
+  if (raw) return baseName(raw)
   const paths = pathsInCode(codeFromArgs(args))
-  return paths.length ? basename(paths[paths.length - 1]) : ''
+  return paths.length ? baseName(paths[paths.length - 1]) : ''
 }
 
 function extractFullPath(args: unknown): string {

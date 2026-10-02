@@ -4,6 +4,7 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { StringDecoder } from 'string_decoder'
 import { EventEmitter } from 'events'
+import { withExtraPath } from './platform'
 
 export interface RpcClientOptions {
   binary: string
@@ -207,15 +208,11 @@ export class RpcClient extends EventEmitter {
   }
 }
 
-function extraPath(): string {
-  return ['/opt/homebrew/bin', '/usr/local/bin', join(homedir(), '.local/bin')].join(':')
-}
-
 function childEnv(overrides?: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, ...overrides, PI_SKIP_VERSION_CHECK: '1' }
   delete env.ELECTRON_RUN_AS_NODE
   delete env.ELECTRON_NO_ASAR
-  env.PATH = `${extraPath()}:${env.PATH ?? '/usr/bin:/bin'}`
+  env.PATH = withExtraPath(env.PATH)
   return env
 }
 

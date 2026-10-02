@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { AppState, FleetEntry } from '../lib/store'
 import type { ExternalAgentInfo, ScheduleJob } from '@shared/types'
+import { baseName } from '@shared/paths'
 
 interface Props {
   state: AppState
@@ -231,7 +232,7 @@ export default function FleetView({ state }: Props): JSX.Element {
             <div className="heartbeat-session">
               <strong>{agent.name}</strong>
               <span>
-                {agent.cwd ? `${agent.cwd.split('/').filter(Boolean).pop()} · ` : ''}
+                {agent.cwd ? `${baseName(agent.cwd)} · ` : ''}
                 {agent.task || 'no messages yet'}
               </span>
             </div>
